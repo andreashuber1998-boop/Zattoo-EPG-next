@@ -6,7 +6,10 @@ MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="
 
 class ReplayProxyTests(unittest.TestCase):
     def test_crops_three_hour_window_to_two_hours(self):
-        root = ET.fromstring(build_replay_mpd(MPD, 7200))
+        output = build_replay_mpd(MPD, 7200)
+        self.assertIn(b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"', output)
+        self.assertNotIn(b"ns0:MPD", output)
+        root = ET.fromstring(output)
         self.assertEqual(root.attrib["type"], "static")
         self.assertEqual(root.attrib["mediaPresentationDuration"], "PT7200S")
         self.assertNotIn("timeShiftBufferDepth", root.attrib)
