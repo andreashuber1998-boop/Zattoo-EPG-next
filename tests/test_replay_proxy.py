@@ -96,6 +96,7 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertIn('data-back="7200"', page)
         self.assertIn("maxBufferLength: 90", page)
         self.assertIn("liveSyncDuration: configuredDelay", page)
+        self.assertNotIn("liveMaxLatencyDuration:", page)
 
     def test_dash_hls_gateway_builds_seekable_video_and_audio(self):
         session = DashHlsSession(
