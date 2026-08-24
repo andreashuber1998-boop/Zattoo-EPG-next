@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from unittest import mock
 
 from zattoo_epg import ZattooEPG, get_credentials_from_config, load_channel_filter
@@ -45,6 +46,21 @@ class ZattooEPGTests(unittest.TestCase):
             epg._store_cached_details(details)
 
             self.assertEqual(len(epg._load_cached_details(list(details))), 1005)
+
+    def test_epg_windows_start_at_six_in_service_timezone(self):
+        epg = ZattooEPG(country="CH")
+        epg.channels = {"channel-1": {"title": "Channel 1", "logo": ""}}
+
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"success": True, "channels": []}
+        epg.session.get = mock.Mock(return_value=response)
+
+        with mock.patch("zattoo_epg.time.sleep"):
+            self.assertTrue(epg.download_epg_data(days=1))
+
+        first_start = epg.session.get.call_args_list[0].kwargs["params"]["start"]
+        local_start = datetime.fromtimestamp(first_start, epg.timezone)
+        self.assertEqual((local_start.hour, local_start.minute), (6, 0))
 
     def test_xmltv_contains_image_and_correct_winter_timezone(self):
         epg = ZattooEPG(country="CH")

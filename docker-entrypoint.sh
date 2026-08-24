@@ -36,7 +36,14 @@ fi
 
 python -m http.server "$HTTP_PORT" --directory /output &
 HTTP_PID=$!
-trap 'kill "$HTTP_PID" 2>/dev/null || true' EXIT INT TERM
+
+cleanup() {
+    kill "$HTTP_PID" 2>/dev/null || true
+    wait "$HTTP_PID" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 while sleep "$UPDATE_INTERVAL_SECONDS"; do
     generate_guide

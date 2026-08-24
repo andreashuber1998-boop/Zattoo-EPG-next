@@ -318,7 +318,15 @@ class ZattooEPG:
             print(f"Downloading EPG data for {days} days...")
             
             # Calculate date range
-            base_date = datetime.now().replace(hour=6, minute=0, second=0, microsecond=0)
+            # Use the selected service timezone rather than the host/container
+            # timezone. Docker commonly runs in UTC, while Zattoo's guide
+            # windows need to start at 06:00 local time (including DST).
+            base_date = datetime.now(self.timezone).replace(
+                hour=6,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
             
             all_programs = []
             total_parts = days * 4
