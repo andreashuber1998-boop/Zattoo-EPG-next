@@ -193,7 +193,7 @@ class ReplayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_response(HTTPStatus.OK); self.end_headers(); self.wfile.write(b"ok\n"); return
-        match = re.fullmatch(r"/(replay|timeshift)/([^/]+)\.mpd", parsed.path)
+        match = re.fullmatch(r"/(replay|timeshift|catchup)/([^/]+)\.mpd", parsed.path)
         if not match or not CHANNEL.fullmatch(match.group(2)):
             self.send_error(HTTPStatus.NOT_FOUND); return
         if self.allowlist is not None and match.group(2) not in self.allowlist:
