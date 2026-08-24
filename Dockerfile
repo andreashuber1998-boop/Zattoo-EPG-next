@@ -14,11 +14,11 @@ RUN apt-get update \
     && mkdir -p /data /output /config \
     && chown -R app:app /app /data /output /config
 
-COPY --chown=app:app zattoo_epg.py docker-entrypoint.sh ./
+COPY --chown=app:app zattoo_epg.py replay_proxy.py docker-entrypoint.sh ./
 RUN chmod 0755 /app/docker-entrypoint.sh
 
 USER app
-EXPOSE 8080
+EXPOSE 8080 8090
 VOLUME ["/data", "/output", "/config"]
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

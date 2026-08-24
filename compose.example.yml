@@ -10,10 +10,14 @@ services:
       CHANNEL_FILTER_FILE: /config/channels.txt
       CACHE_TTL_DAYS: "30"
       UPDATE_INTERVAL_SECONDS: "43200"
+      REPLAY_ENABLED: "true"
+      REPLAY_PORT: "8090"
+      TELERISING_BASE_URL: ${TELERISING_BASE_URL:?Set TELERISING_BASE_URL in .env}\n      REPLAY_CHANNEL_FILTER_FILE: /config/replay-channels.txt
     volumes:
       - ./data:/data
       - ./output:/output
-      - ./channels.txt:/config/channels.txt:ro
+      - ./channels.txt:/config/channels.txt:ro\n      - ./replay-channels.txt:/config/replay-channels.txt:ro
     ports:
       - "8080:8080"
+      - "8090:8090"
     restart: unless-stopped

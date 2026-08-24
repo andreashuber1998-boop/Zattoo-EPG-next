@@ -51,6 +51,26 @@ Point TVHeadend's XMLTV URL grabber at that URL. Test this fork on a separate
 port/output first; do not replace a working production EPG until channel mapping
 and programme images have been verified.
 
+## Experimental DASH replay proxy
+
+Zattoo live DASH manifests can expose a server-side timeshift window. The optional
+replay proxy converts a selected part of that dynamic window into a static MPD,
+without continuously recording every channel. Enable it only on a trusted network:
+
+```env
+TELERISING_BASE_URL=http://YOUR-TELERISING-HOST:5000
+```
+
+Then request a channel with an offset in seconds (7200 means two hours):
+
+```text
+http://SERVER-IP:8090/replay/CHANNEL.mpd?offset=7200
+```
+
+The proxy does not store credentials, video segments, or signed stream URLs. It
+fetches a fresh upstream manifest for each request. This endpoint is experimental;
+validate one channel with FFmpeg before adding it to TVHeadend or Jellyfin.
+
 ## Requirements
 
 - Python 3.9 or higher (Python 3.12 is used by the Docker image)

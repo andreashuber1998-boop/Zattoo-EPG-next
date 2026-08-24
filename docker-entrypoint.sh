@@ -37,9 +37,21 @@ fi
 python -m http.server "$HTTP_PORT" --directory /output &
 HTTP_PID=$!
 
+REPLAY_PID=""
+if [ "${REPLAY_ENABLED:-false}" = "true" ]; then
+    python /app/replay_proxy.py &
+    REPLAY_PID=$!
+fi
+
 cleanup() {
     kill "$HTTP_PID" 2>/dev/null || true
+    if [ -n "$REPLAY_PID" ]; then
+        kill "$REPLAY_PID" 2>/dev/null || true
+    fi
     wait "$HTTP_PID" 2>/dev/null || true
+    if [ -n "$REPLAY_PID" ]; then
+        wait "$REPLAY_PID" 2>/dev/null || true
+    fi
 }
 
 trap cleanup EXIT
