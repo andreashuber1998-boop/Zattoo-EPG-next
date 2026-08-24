@@ -94,9 +94,21 @@ class ReplayProxyTests(unittest.TestCase):
         video = session.media_playlist(0).decode()
         audio = session.media_playlist(1).decode()
         self.assertIn('AUDIO="audio"', master)
-        self.assertIn('URI="track-1.m3u8"', master)
+        self.assertIn(
+            'URI="track-1.m3u8?window=7200&delay=10"', master
+        )
+        self.assertIn(
+            "track-0.m3u8?window=7200&delay=10", master
+        )
         self.assertIn("#EXT-X-START:TIME-OFFSET=-10", video)
         self.assertIn("#EXT-X-TARGETDURATION:8", video)
+        self.assertIn(
+            'track-0/init.mp4?window=7200&delay=10', video
+        )
+        self.assertIn(
+            'track-0/segment-13600000.m4s?window=7200&delay=10',
+            video,
+        )
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:6800", video)
         self.assertEqual(video.count("#EXTINF:"), 3600)
         self.assertEqual(audio.count("#EXTINF:"), 3600)
