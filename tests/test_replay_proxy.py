@@ -1,6 +1,8 @@
 import unittest
 import xml.etree.ElementTree as ET
-from replay_proxy import build_replay_mpd, build_timeshift_mpd, local_name
+import os
+import tempfile
+from replay_proxy import build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
 
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
 
@@ -30,5 +32,14 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertEqual(root.attrib["type"], "dynamic")
         self.assertEqual(root.attrib["timeShiftBufferDepth"], "PT7200S")
         self.assertEqual(root.attrib["suggestedPresentationDelay"], "PT10S")
+
+    def test_replay_channel_allowlist_ignores_comments(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("# enabled replay channels\nprosieben\nzdf # family\n")
+            path = handle.name
+        try:
+            self.assertEqual(load_channel_allowlist(path), {"prosieben", "zdf"})
+        finally:
+            os.unlink(path)
 
 if __name__ == "__main__": unittest.main()
