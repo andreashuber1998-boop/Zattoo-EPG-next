@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Expose a provider DASH DVR window as replay and on-demand HLS."""
 
+import json
 import os
 import re
 import threading
@@ -386,6 +387,134 @@ def build_catchup_mpd(
         period.attrib.pop("duration", None)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
+
+def build_player_page(channel, window_seconds=7200, delay_seconds=30):
+    """Build a same-origin HLS.js player with two-hour DVR controls."""
+    stream_url = (
+        f"/hls/{quote(channel)}/master.m3u8"
+        f"?window={window_seconds}&delay={delay_seconds}"
+    )
+    channel_json = json.dumps(channel)
+    stream_json = json.dumps(stream_url)
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TV Replay – {channel}</title>
+<style>
+:root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
+body {{ margin: 0; background: #101114; color: #fff; }}
+main {{ width: min(1200px, 100%); margin: auto; padding: 16px; box-sizing: border-box; }}
+video {{ width: 100%; max-height: 75vh; background: #000; }}
+.controls {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }}
+button {{ border: 0; border-radius: 6px; padding: 10px 14px; font-weight: 650; cursor: pointer; }}
+.live {{ background: #e53935; color: #fff; }}
+.status {{ margin-top: 10px; color: #c8cad0; font-variant-numeric: tabular-nums; }}
+.error {{ color: #ff8a80; }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+</head>
+<body>
+<main>
+<h1 id="title"></h1>
+<video id="video" controls playsinline></video>
+<div class="controls">
+<button data-back="7200">−2 Stunden</button>
+<button data-back="3600">−1 Stunde</button>
+<button data-back="1800">−30 Minuten</button>
+<button data-back="600">−10 Minuten</button>
+<button class="live" id="live">Live</button>
+</div>
+<div class="status" id="status">Stream wird geladen …</div>
+</main>
+<script>
+const channel = {channel_json};
+const source = {stream_json};
+const configuredDelay = {int(delay_seconds)};
+const video = document.getElementById("video");
+const status = document.getElementById("status");
+document.getElementById("title").textContent = "TV Replay – " + channel;
+
+function range() {{
+  if (!video.seekable.length) return null;
+  const last = video.seekable.length - 1;
+  return {{start: video.seekable.start(0), end: video.seekable.end(last)}};
+}}
+function seekBack(seconds) {{
+  const current = range();
+  if (!current) return;
+  video.currentTime = Math.max(current.start, current.end - seconds);
+  video.play().catch(() => {{}});
+}}
+function goLive() {{
+  const current = range();
+  if (!current) return;
+  video.currentTime = Math.max(current.start, current.end - configuredDelay);
+  video.play().catch(() => {{}});
+}}
+function clock(seconds) {{
+  seconds = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return [hours, minutes, secs].map(value => String(value).padStart(2, "0")).join(":");
+}}
+function updateStatus() {{
+  const current = range();
+  if (!current) {{
+    status.textContent = "Puffer wird aufgebaut …";
+    return;
+  }}
+  const behind = current.end - video.currentTime;
+  const available = current.end - current.start;
+  status.textContent = "Verfügbar: " + clock(available) +
+    " · hinter Live: " + clock(behind) +
+    " · gepuffert: " + clock(video.buffered.length ?
+      video.buffered.end(video.buffered.length - 1) - video.currentTime : 0);
+}}
+document.querySelectorAll("[data-back]").forEach(button => {{
+  button.addEventListener("click", () => seekBack(Number(button.dataset.back)));
+}});
+document.getElementById("live").addEventListener("click", goLive);
+video.addEventListener("timeupdate", updateStatus);
+video.addEventListener("progress", updateStatus);
+
+if (window.Hls && Hls.isSupported()) {{
+  const hls = new Hls({{
+    liveSyncDuration: configuredDelay,
+    liveMaxLatencyDuration: configuredDelay + 30,
+    maxBufferLength: 90,
+    maxMaxBufferLength: 180,
+    backBufferLength: 7200,
+    liveDurationInfinity: true,
+    enableWorker: true
+  }});
+  hls.loadSource(source);
+  hls.attachMedia(video);
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {{
+    goLive();
+    updateStatus();
+  }});
+  hls.on(Hls.Events.ERROR, (_event, data) => {{
+    if (data.fatal) {{
+      status.classList.add("error");
+      status.textContent = "Playerfehler: " + data.details;
+    }}
+  }});
+}} else if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+  video.src = source;
+  video.addEventListener("loadedmetadata", goLive, {{once: true}});
+}} else {{
+  status.classList.add("error");
+  status.textContent = "Dieser Browser unterstützt HLS nicht.";
+}}
+</script>
+</body>
+</html>
+""".encode()
+
+
 class ReplayHandler(BaseHTTPRequestHandler):
     upstream = os.environ.get("TELERISING_BASE_URL", "").rstrip("/")
     timeout = float(os.environ.get("REPLAY_UPSTREAM_TIMEOUT", "15"))
@@ -431,6 +560,24 @@ class ReplayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_response(HTTPStatus.OK); self.end_headers(); self.wfile.write(b"ok\n"); return
+        player = re.fullmatch(r"/player/([^/]+)", parsed.path)
+        if player:
+            channel = player.group(1)
+            if not CHANNEL.fullmatch(channel):
+                self.send_error(HTTPStatus.NOT_FOUND); return
+            if self.allowlist is not None and channel not in self.allowlist:
+                self.send_error(HTTPStatus.NOT_FOUND); return
+            try:
+                query = parse_qs(parsed.query)
+                window = int(query.get("window", ["7200"])[0])
+                delay = int(query.get("delay", ["30"])[0])
+                if window < 60 or delay < 1 or delay >= window:
+                    raise ValueError("invalid player window or delay")
+                output = build_player_page(channel, window, delay)
+            except ValueError as error:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(error)); return
+            self.send_bytes(output, "text/html; charset=utf-8")
+            return
         hls = re.fullmatch(
             r"/hls/([^/]+)/(master|track-(\d+))\.m3u8", parsed.path
         )
