@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Turn a dynamic Zattoo DASH window into a static replay MPD."""
+"""Expose a provider DASH DVR window as replay and on-demand HLS."""
 
 import os
 import re
 import threading
+import math
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse, urljoin
 from urllib.request import Request, urlopen
 
 ISO_DURATION = re.compile(r"^PT(?:(?P<hours>[0-9.]+)H)?(?:(?P<minutes>[0-9.]+)M)?(?:(?P<seconds>[0-9.]+)S)?$")
@@ -148,6 +149,115 @@ class CatchupTimelineState:
                 raise ValueError("DASH manifest has no SegmentTimeline")
 
 
+def substitute_dash_template(value, representation_id, segment_time=None):
+    value = value.replace("$RepresentationID$", representation_id)
+    if segment_time is not None:
+        value = value.replace("$Time$", str(segment_time))
+    return value.replace("$$", "$")
+
+
+class DashHlsSession:
+    """Translate one DASH DVR window into sliding fMP4 HLS playlists."""
+
+    def __init__(self, channel, window_seconds=7200, delay_seconds=10):
+        self.channel = channel
+        self.window_seconds = window_seconds
+        self.delay_seconds = delay_seconds
+        self.lock = threading.Lock()
+        self.tracks = []
+
+    def update(self, source, source_url):
+        root = ET.fromstring(source)
+        if local_name(root.tag) != "MPD":
+            raise ValueError("upstream response is not a DASH MPD")
+        upstream_window = parse_duration(root.attrib.get("timeShiftBufferDepth", ""))
+        if self.window_seconds > upstream_window:
+            raise ValueError("requested HLS window exceeds upstream window")
+        tracks = []
+        for adaptation in (node for node in root.iter() if local_name(node.tag) == "AdaptationSet"):
+            adaptation_template = next((node for node in adaptation if local_name(node.tag) == "SegmentTemplate"), None)
+            for representation in (node for node in adaptation if local_name(node.tag) == "Representation"):
+                template = next((node for node in representation if local_name(node.tag) == "SegmentTemplate"), adaptation_template)
+                if template is None:
+                    continue
+                timeline = next((node for node in template if local_name(node.tag) == "SegmentTimeline"), None)
+                if timeline is None:
+                    continue
+                timescale = int(template.attrib.get("timescale", "1"))
+                entries = expand_timeline(timeline, upstream_window, timescale)
+                end = entries[-1][0] + entries[-1][1]
+                start_limit = end - self.window_seconds * timescale
+                entries = [item for item in entries if item[0] + item[1] > start_limit]
+                mime = representation.attrib.get("mimeType") or adaptation.attrib.get("mimeType", "")
+                content_type = representation.attrib.get("contentType") or adaptation.attrib.get("contentType", "")
+                kind = "audio" if content_type == "audio" or mime.startswith("audio/") else "video"
+                base = next(((node.text or "").strip() for node in representation if local_name(node.tag) == "BaseURL"), source_url)
+                tracks.append({
+                    "kind": kind,
+                    "id": representation.attrib.get("id", str(len(tracks))),
+                    "bandwidth": int(representation.attrib.get("bandwidth", "1")),
+                    "codecs": representation.attrib.get("codecs") or adaptation.attrib.get("codecs", ""),
+                    "width": representation.attrib.get("width"),
+                    "height": representation.attrib.get("height"),
+                    "frame_rate": representation.attrib.get("frameRate") or adaptation.attrib.get("frameRate"),
+                    "timescale": timescale,
+                    "entries": entries,
+                    "media": urljoin(base, template.attrib["media"]),
+                    "initialization": urljoin(base, template.attrib["initialization"]),
+                })
+        if not tracks:
+            raise ValueError("DASH manifest has no playable representations")
+        with self.lock:
+            self.tracks = tracks
+
+    def master_playlist(self):
+        with self.lock:
+            videos = [(index, track) for index, track in enumerate(self.tracks) if track["kind"] == "video"]
+            audios = [(index, track) for index, track in enumerate(self.tracks) if track["kind"] == "audio"]
+            lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+            if audios:
+                lines.append('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,' f'URI="track-{audios[0][0]}.m3u8"')
+            for index, track in videos:
+                attrs = [f'BANDWIDTH={track["bandwidth"]}']
+                if track["codecs"]:
+                    codecs = track["codecs"]
+                    if audios and audios[0][1]["codecs"]:
+                        codecs += "," + audios[0][1]["codecs"]
+                    attrs.append(f'CODECS="{codecs}"')
+                if track["width"] and track["height"]:
+                    attrs.append(f'RESOLUTION={track["width"]}x{track["height"]}')
+                if track["frame_rate"]:
+                    attrs.append(f'FRAME-RATE={track["frame_rate"]}')
+                if audios:
+                    attrs.append('AUDIO="audio"')
+                lines.extend(["#EXT-X-STREAM-INF:" + ",".join(attrs), f"track-{index}.m3u8"])
+            return ("\n".join(lines) + "\n").encode()
+
+    def media_playlist(self, index):
+        with self.lock:
+            track = self.tracks[index]
+            entries = track["entries"]
+            if not entries:
+                raise ValueError("track has no segments")
+            target = max(1, math.ceil(max(duration for _, duration in entries) / track["timescale"]))
+            lines = [
+                "#EXTM3U", "#EXT-X-VERSION:7",
+                f"#EXT-X-TARGETDURATION:{target}",
+                "#EXT-X-MEDIA-SEQUENCE:0",
+                f"#EXT-X-START:TIME-OFFSET=-{self.delay_seconds},PRECISE=NO",
+                f'#EXT-X-MAP:URI="track-{index}/init.mp4"',
+            ]
+            for start, duration in entries:
+                lines.extend([f"#EXTINF:{duration / track['timescale']:.6f},", f"track-{index}/segment-{start}.m4s"])
+            return ("\n".join(lines) + "\n").encode()
+
+    def segment_url(self, index, segment_time=None):
+        with self.lock:
+            track = self.tracks[index]
+            template = track["initialization"] if segment_time is None else track["media"]
+            return substitute_dash_template(template, track["id"], segment_time)
+
+
 def build_replay_mpd(source, offset_seconds):
     root = ET.fromstring(source)
     if local_name(root.tag) != "MPD":
@@ -249,6 +359,8 @@ class ReplayHandler(BaseHTTPRequestHandler):
     allowlist = load_channel_allowlist(os.environ.get("REPLAY_CHANNEL_FILTER_FILE", ""))
     catchup_states = {}
     catchup_states_lock = threading.Lock()
+    hls_sessions = {}
+    hls_sessions_lock = threading.Lock()
 
     @classmethod
     def catchup_state(cls, channel):
@@ -257,10 +369,72 @@ class ReplayHandler(BaseHTTPRequestHandler):
                 channel, CatchupTimelineState()
             )
 
+    @classmethod
+    def hls_session(cls, channel, window, delay):
+        key = (channel, window, delay)
+        with cls.hls_sessions_lock:
+            return cls.hls_sessions.setdefault(
+                key, DashHlsSession(channel, window, delay)
+            )
+
+    def fetch_upstream(self, channel):
+        source_url = f"{self.upstream}/api/zc2/live/{quote(channel)}"
+        request = Request(
+            source_url,
+            headers={"User-Agent": "DASH-HLS-Gateway/1.0"},
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            return response.read(), response.geturl()
+
+    def send_bytes(self, output, content_type):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(output)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(output)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_response(HTTPStatus.OK); self.end_headers(); self.wfile.write(b"ok\n"); return
+        hls = re.fullmatch(
+            r"/hls/([^/]+)/(master|track-(\d+))\.m3u8", parsed.path
+        )
+        segment = re.fullmatch(
+            r"/hls/([^/]+)/track-(\d+)/(init\.mp4|segment-(\d+)\.m4s)",
+            parsed.path,
+        )
+        if hls or segment:
+            channel = (hls or segment).group(1)
+            if not CHANNEL.fullmatch(channel):
+                self.send_error(HTTPStatus.NOT_FOUND); return
+            if self.allowlist is not None and channel not in self.allowlist:
+                self.send_error(HTTPStatus.NOT_FOUND); return
+            query = parse_qs(parsed.query)
+            window = int(query.get("window", ["7200"])[0])
+            delay = int(query.get("delay", ["10"])[0])
+            session = self.hls_session(channel, window, delay)
+            try:
+                if hls:
+                    source, source_url = self.fetch_upstream(channel)
+                    session.update(source, source_url)
+                    output = session.master_playlist() if hls.group(2) == "master" else session.media_playlist(int(hls.group(3)))
+                    self.send_bytes(output, "application/vnd.apple.mpegurl")
+                else:
+                    index = int(segment.group(2))
+                    segment_time = None if segment.group(3) == "init.mp4" else int(segment.group(4))
+                    request = Request(
+                        session.segment_url(index, segment_time),
+                        headers={"User-Agent": "DASH-HLS-Gateway/1.0"},
+                    )
+                    with urlopen(request, timeout=self.timeout) as response:
+                        output = response.read()
+                        content_type = response.headers.get_content_type()
+                    self.send_bytes(output, content_type)
+            except (ValueError, IndexError, HTTPError, URLError, TimeoutError) as error:
+                self.send_error(HTTPStatus.BAD_GATEWAY, str(error))
+            return
         match = re.fullmatch(r"/(replay|timeshift|catchup)/([^/]+)\.mpd", parsed.path)
         if not match or not CHANNEL.fullmatch(match.group(2)):
             self.send_error(HTTPStatus.NOT_FOUND); return
@@ -270,12 +444,7 @@ class ReplayHandler(BaseHTTPRequestHandler):
             if not self.upstream:
                 raise ValueError("TELERISING_BASE_URL is not configured")
             query = parse_qs(parsed.query)
-            request = Request(
-                f"{self.upstream}/api/zc2/live/{quote(match.group(2))}",
-                headers={"User-Agent": "Zattoo-EPG-Replay-Proxy/1.0"},
-            )
-            with urlopen(request, timeout=self.timeout) as response:
-                source = response.read()
+            source, _ = self.fetch_upstream(match.group(2))
             if match.group(1) == "replay":
                 output = build_replay_mpd(source, int(query.get("offset", ["7200"])[0]))
             elif match.group(1) == "catchup":
@@ -293,11 +462,7 @@ class ReplayHandler(BaseHTTPRequestHandler):
                 )
         except (ValueError, HTTPError, URLError, TimeoutError) as error:
             self.send_error(HTTPStatus.BAD_GATEWAY, str(error)); return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/dash+xml")
-        self.send_header("Content-Length", str(len(output)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers(); self.wfile.write(output)
+        self.send_bytes(output, "application/dash+xml")
 
 
 def main():
