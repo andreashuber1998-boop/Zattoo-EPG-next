@@ -149,8 +149,11 @@ class CatchupTimelineState:
                 raise ValueError("DASH manifest has no SegmentTimeline")
 
 
-def substitute_dash_template(value, representation_id, segment_time=None):
+def substitute_dash_template(
+    value, representation_id, bandwidth, segment_time=None
+):
     value = value.replace("$RepresentationID$", representation_id)
+    value = value.replace("$Bandwidth$", str(bandwidth))
     if segment_time is not None:
         value = value.replace("$Time$", str(segment_time))
     return value.replace("$$", "$")
@@ -255,7 +258,9 @@ class DashHlsSession:
         with self.lock:
             track = self.tracks[index]
             template = track["initialization"] if segment_time is None else track["media"]
-            return substitute_dash_template(template, track["id"], segment_time)
+            return substitute_dash_template(
+                template, track["id"], track["bandwidth"], segment_time
+            )
 
 
 def build_replay_mpd(source, offset_seconds):
