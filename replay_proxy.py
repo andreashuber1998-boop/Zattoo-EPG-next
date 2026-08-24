@@ -14,6 +14,20 @@ ISO_DURATION = re.compile(r"^PT(?:(?P<hours>[0-9.]+)H)?(?:(?P<minutes>[0-9.]+)M)
 CHANNEL = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
+def load_channel_allowlist(path):
+    if not path:
+        return None
+    allowed = set()
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            value = line.split("#", 1)[0].strip()
+            if value:
+                if not CHANNEL.fullmatch(value):
+                    raise ValueError(f"invalid replay channel in allowlist: {value!r}")
+                allowed.add(value)
+    return allowed
+
+
 def parse_duration(value):
     match = ISO_DURATION.match(value or "")
     if not match:
@@ -132,6 +146,7 @@ def build_timeshift_mpd(source, window_seconds=7200, delay_seconds=10):
 class ReplayHandler(BaseHTTPRequestHandler):
     upstream = os.environ.get("TELERISING_BASE_URL", "").rstrip("/")
     timeout = float(os.environ.get("REPLAY_UPSTREAM_TIMEOUT", "15"))
+    allowlist = load_channel_allowlist(os.environ.get("REPLAY_CHANNEL_FILTER_FILE", ""))
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -139,6 +154,8 @@ class ReplayHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK); self.end_headers(); self.wfile.write(b"ok\n"); return
         match = re.fullmatch(r"/(replay|timeshift)/([^/]+)\.mpd", parsed.path)
         if not match or not CHANNEL.fullmatch(match.group(2)):
+            self.send_error(HTTPStatus.NOT_FOUND); return
+        if self.allowlist is not None and match.group(2) not in self.allowlist:
             self.send_error(HTTPStatus.NOT_FOUND); return
         try:
             if not self.upstream:
