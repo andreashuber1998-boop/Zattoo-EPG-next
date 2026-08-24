@@ -218,8 +218,12 @@ class DashHlsSession:
             videos = [(index, track) for index, track in enumerate(self.tracks) if track["kind"] == "video"]
             audios = [(index, track) for index, track in enumerate(self.tracks) if track["kind"] == "audio"]
             lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+            query = (
+                f"?window={self.window_seconds}"
+                f"&delay={self.delay_seconds}"
+            )
             if audios:
-                lines.append('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,' f'URI="track-{audios[0][0]}.m3u8"')
+                lines.append('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,' f'URI="track-{audios[0][0]}.m3u8{query}"')
             for index, track in videos:
                 attrs = [f'BANDWIDTH={track["bandwidth"]}']
                 if track["codecs"]:
@@ -233,7 +237,10 @@ class DashHlsSession:
                     attrs.append(f'FRAME-RATE={track["frame_rate"]}')
                 if audios:
                     attrs.append('AUDIO="audio"')
-                lines.extend(["#EXT-X-STREAM-INF:" + ",".join(attrs), f"track-{index}.m3u8"])
+                lines.extend([
+                    "#EXT-X-STREAM-INF:" + ",".join(attrs),
+                    f"track-{index}.m3u8{query}",
+                ])
             return ("\n".join(lines) + "\n").encode()
 
     def media_playlist(self, index):
@@ -257,15 +264,22 @@ class DashHlsSession:
             # stop at the live edge after only a few seconds.
             first_start, first_duration = entries[0]
             media_sequence = first_start // first_duration
+            query = (
+                f"?window={self.window_seconds}"
+                f"&delay={self.delay_seconds}"
+            )
             lines = [
                 "#EXTM3U", "#EXT-X-VERSION:7",
                 f"#EXT-X-TARGETDURATION:{target}",
                 f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
                 f"#EXT-X-START:TIME-OFFSET=-{self.delay_seconds},PRECISE=NO",
-                f'#EXT-X-MAP:URI="track-{index}/init.mp4"',
+                f'#EXT-X-MAP:URI="track-{index}/init.mp4{query}"',
             ]
             for start, duration in entries:
-                lines.extend([f"#EXTINF:{duration / track['timescale']:.6f},", f"track-{index}/segment-{start}.m4s"])
+                lines.extend([
+                    f"#EXTINF:{duration / track['timescale']:.6f},",
+                    f"track-{index}/segment-{start}.m4s{query}",
+                ])
             return ("\n".join(lines) + "\n").encode()
 
     def segment_url(self, index, segment_time=None):
