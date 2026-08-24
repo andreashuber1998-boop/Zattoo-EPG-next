@@ -243,10 +243,15 @@ class DashHlsSession:
             if not entries:
                 raise ValueError("track has no segments")
             target = max(1, math.ceil(max(duration for _, duration in entries) / track["timescale"]))
+            # HLS clients use MEDIA-SEQUENCE to recognize new segments in a
+            # refreshed sliding playlist. Keeping this at zero makes FFmpeg
+            # stop at the live edge after only a few seconds.
+            first_start, first_duration = entries[0]
+            media_sequence = first_start // first_duration
             lines = [
                 "#EXTM3U", "#EXT-X-VERSION:7",
                 f"#EXT-X-TARGETDURATION:{target}",
-                "#EXT-X-MEDIA-SEQUENCE:0",
+                f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
                 f"#EXT-X-START:TIME-OFFSET=-{self.delay_seconds},PRECISE=NO",
                 f'#EXT-X-MAP:URI="track-{index}/init.mp4"',
             ]
