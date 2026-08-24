@@ -96,6 +96,7 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertIn('AUDIO="audio"', master)
         self.assertIn('URI="track-1.m3u8"', master)
         self.assertIn("#EXT-X-START:TIME-OFFSET=-10", video)
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:6800", video)
         self.assertEqual(video.count("#EXTINF:"), 3600)
         self.assertEqual(audio.count("#EXTINF:"), 3600)
         self.assertEqual(
@@ -106,5 +107,15 @@ class ReplayProxyTests(unittest.TestCase):
             session.segment_url(1),
             "https://media.example/live/audio-a1-init.mp4",
         )
+
+        shifted = HLS_MPD.replace(
+            b't="10000000" d="2000" r="5399"',
+            b't="10002000" d="2000" r="5399"',
+        )
+        session.update(
+            shifted, "https://media.example/live/manifest.mpd"
+        )
+        refreshed = session.media_playlist(0).decode()
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:6801", refreshed)
 
 if __name__ == "__main__": unittest.main()
