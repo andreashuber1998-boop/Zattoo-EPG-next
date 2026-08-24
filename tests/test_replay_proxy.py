@@ -2,9 +2,14 @@ import unittest
 import xml.etree.ElementTree as ET
 import os
 import tempfile
-from replay_proxy import CatchupTimelineState, build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
+from replay_proxy import CatchupTimelineState, DashHlsSession, build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
 
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
+
+HLS_MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S"><Period>
+<AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v1" bandwidth="5000000" codecs="avc1.4d402a" width="1920" height="1080" frameRate="50"><SegmentTemplate timescale="1000" initialization="video-$RepresentationID$-init.mp4" media="video-$RepresentationID$-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>
+<AdaptationSet contentType="audio" mimeType="audio/mp4"><Representation id="a1" bandwidth="256000" codecs="ec-3"><SegmentTemplate timescale="1000" initialization="audio-$RepresentationID$-init.mp4" media="audio-$RepresentationID$-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>
+</Period></MPD>'''
 
 class ReplayProxyTests(unittest.TestCase):
     def test_crops_three_hour_window_to_two_hours(self):
@@ -73,11 +78,33 @@ class ReplayProxyTests(unittest.TestCase):
 
     def test_replay_channel_allowlist_ignores_comments(self):
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-            handle.write("# enabled replay channels\nprosieben\nzdf # family\n")
+            handle.write("# enabled replay channels\nchannel-one\nchannel-two # family\n")
             path = handle.name
         try:
-            self.assertEqual(load_channel_allowlist(path), {"prosieben", "zdf"})
+            self.assertEqual(load_channel_allowlist(path), {"channel-one", "channel-two"})
         finally:
             os.unlink(path)
+
+    def test_dash_hls_gateway_builds_seekable_video_and_audio(self):
+        session = DashHlsSession(
+            "example-channel", window_seconds=7200, delay_seconds=10
+        )
+        session.update(HLS_MPD, "https://media.example/live/manifest.mpd")
+        master = session.master_playlist().decode()
+        video = session.media_playlist(0).decode()
+        audio = session.media_playlist(1).decode()
+        self.assertIn('AUDIO="audio"', master)
+        self.assertIn('URI="track-1.m3u8"', master)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-10", video)
+        self.assertEqual(video.count("#EXTINF:"), 3600)
+        self.assertEqual(audio.count("#EXTINF:"), 3600)
+        self.assertEqual(
+            session.segment_url(0, 10000000),
+            "https://media.example/live/video-v1-10000000.m4s",
+        )
+        self.assertEqual(
+            session.segment_url(1),
+            "https://media.example/live/audio-a1-init.mp4",
+        )
 
 if __name__ == "__main__": unittest.main()
