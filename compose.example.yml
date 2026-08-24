@@ -1,0 +1,19 @@
+services:
+  zattoo-epg:
+    build: .
+    container_name: zattoo-epg
+    environment:
+      ZATTOO_EMAIL: ${ZATTOO_EMAIL:?Set ZATTOO_EMAIL in .env}
+      ZATTOO_PASSWORD: ${ZATTOO_PASSWORD:?Set ZATTOO_PASSWORD in .env}
+      COUNTRY: CH
+      DAYS: "7"
+      CHANNEL_FILTER_FILE: /config/channels.txt
+      CACHE_TTL_DAYS: "30"
+      UPDATE_INTERVAL_SECONDS: "43200"
+    volumes:
+      - ./data:/data
+      - ./output:/output
+      - ./channels.txt:/config/channels.txt:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

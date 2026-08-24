@@ -1,0 +1,8 @@
+# Exact Zattoo channel IDs or display names, one per line.
+# Replace this example with the names used by your own Zattoo account.
+SRF 1 HD
+SRF zwei HD
+Das Erste HD
+ZDF HD
+Pro7 Schweiz HD
+Sat.1 Schweiz HD
