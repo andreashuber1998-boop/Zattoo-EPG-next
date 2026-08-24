@@ -21,12 +21,22 @@ from typing import Dict, List, Optional, Any, Union
 import argparse
 import socket
 import subprocess
+import sqlite3
+import html
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 class ZattooEPG:
     """Main class for Zattoo EPG downloading and processing."""
     
-    def __init__(self, country: str = "DE"):
+    def __init__(
+        self,
+        country: str = "DE",
+        channel_filter: Optional[List[str]] = None,
+        cache_path: Optional[str] = None,
+        cache_ttl_days: int = 30,
+    ):
         """Initialize the Zattoo EPG grabber.
         
         Args:
@@ -34,11 +44,21 @@ class ZattooEPG:
         """
         self.country = country.upper()
         self.language = "de" if country.upper() == "DE" else "de"
+        self.timezone = ZoneInfo("Europe/Berlin" if self.country == "DE" else "Europe/Zurich")
         self.session = requests.Session()
         self.session_token = None
         self.power_guide_hash = None
         self.channels = {}
         self.epg_data = []
+        self.channel_filter = {
+            self._normalize_channel_name(item)
+            for item in (channel_filter or [])
+            if item.strip()
+        }
+        self.cache_path = cache_path
+        self.cache_ttl_seconds = cache_ttl_days * 86400
+        if self.cache_path:
+            self._init_cache()
         
         # Set User-Agent
         self.session.headers.update({
@@ -48,6 +68,84 @@ class ZattooEPG:
         })
         
         print(f"+++ COUNTRY: {self.country} +++\n")
+
+    @staticmethod
+    def _normalize_channel_name(value: str) -> str:
+        """Normalize a channel identifier for exact, case-insensitive matching."""
+        return " ".join(value.casefold().split())
+
+    def _channel_is_selected(self, cid: str, title: str) -> bool:
+        if not self.channel_filter:
+            return True
+        return bool(
+            {
+                self._normalize_channel_name(cid),
+                self._normalize_channel_name(title),
+            }
+            & self.channel_filter
+        )
+
+    def _init_cache(self) -> None:
+        cache_file = Path(self.cache_path)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(cache_file) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS program_details (
+                    program_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+
+    def _load_cached_details(self, program_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        if not self.cache_path or not program_ids:
+            return {}
+        minimum_timestamp = int(time.time()) - self.cache_ttl_seconds
+        rows = []
+        with sqlite3.connect(self.cache_path) as connection:
+            # Stay below SQLite's variable limit even for large guides.
+            for offset in range(0, len(program_ids), 900):
+                chunk = program_ids[offset:offset + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT program_id, payload
+                        FROM program_details
+                        WHERE updated_at >= ? AND program_id IN ({placeholders})
+                        """,
+                        [minimum_timestamp, *chunk],
+                    ).fetchall()
+                )
+        result = {}
+        for program_id, payload in rows:
+            try:
+                result[str(program_id)] = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+        return result
+
+    def _store_cached_details(self, details: Dict[str, Dict[str, Any]]) -> None:
+        if not self.cache_path or not details:
+            return
+        updated_at = int(time.time())
+        rows = [
+            (str(program_id), json.dumps(payload, ensure_ascii=False), updated_at)
+            for program_id, payload in details.items()
+        ]
+        with sqlite3.connect(self.cache_path) as connection:
+            connection.executemany(
+                """
+                INSERT INTO program_details(program_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(program_id) DO UPDATE SET
+                    payload=excluded.payload,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
     
     def get_session_token(self) -> bool:
         """Get initial session token from Zattoo."""
@@ -183,7 +281,7 @@ class ZattooEPG:
                         cid = channel.get('cid')
                         title = channel.get('title', '')
                         
-                        if cid and title:
+                        if cid and title and self._channel_is_selected(str(cid), title):
                             # Get logo URL
                             logo_url = ""
                             qualities = channel.get('qualities', [])
@@ -199,6 +297,8 @@ class ZattooEPG:
                             }
             
             print(f" OK! ({len(self.channels)} channels)")
+            if self.channel_filter:
+                print(f"Channel filter active: {len(self.channel_filter)} requested entries")
             return len(self.channels) > 0
             
         except Exception as e:
@@ -266,7 +366,7 @@ class ZattooEPG:
                         cid = channel.get('cid') or channel.get('id')
                         channel_programs = channel.get('programs', [])
                         
-                        if cid and channel_programs:
+                        if cid in self.channels and channel_programs:
                             for program in channel_programs:
                                 # Add channel ID to program data
                                 program['cid'] = cid
@@ -345,102 +445,76 @@ class ZattooEPG:
         """Enhance EPG data with detailed program information."""
         print("Enhancing EPG data with details...")
         start_time = time.time()
-        
-        program_ids = []
+
+        programs_by_id: Dict[str, List[Dict[str, Any]]] = {}
         for program in self.epg_data:
             program_id = program.get('id')
-            if program_id:
-                program_ids.append(str(program_id))  # Convert to string
-        
-        print(f"Fetching details for {len(program_ids)} programs...")
-        
-        # Use smaller batches and longer delays to avoid rate limiting
-        batch_size = 20  # Smaller batch size to be more respectful
-        enhanced_count = 0
-        failed_count = 0
+            if program_id is not None:
+                programs_by_id.setdefault(str(program_id), []).append(program)
+
+        program_ids = list(programs_by_id)
+        cached_details = self._load_cached_details(program_ids)
+        missing_ids = [program_id for program_id in program_ids if program_id not in cached_details]
+        print(
+            f"Unique programs: {len(program_ids)}; cache hits: {len(cached_details)}; "
+            f"API lookups: {len(missing_ids)}"
+        )
+
+        fetched_details: Dict[str, Dict[str, Any]] = {}
+        batch_size = 20
+        total_batches = (len(missing_ids) + batch_size - 1) // batch_size
         connection_errors = 0
-        
-        total_batches = (len(program_ids) + batch_size - 1) // batch_size
-        
-        for i in range(0, len(program_ids), batch_size):
-            batch = program_ids[i:i + batch_size]
-            batch_start = time.time()
-            current_batch = i // batch_size + 1
-            
-            # Show progress bar
-            progress_bar = show_progress_bar(current_batch - 1, total_batches, "Enhancing EPG", 30)
-            print(f"\r{progress_bar}", end="", flush=True)
-            
-            # Use batch request instead of individual requests with retry mechanism
-            batch_details = {}
-            retry_count = 0
-            max_retries = 3
-            
-            while retry_count < max_retries and not batch_details:
-                batch_details = self.get_program_details_batch(batch)
-                if not batch_details:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = 2 ** retry_count  # Exponential backoff: 2s, 4s, 8s
-                        print(f"\n  RETRY {retry_count}/{max_retries} in {wait_time}s...", end="", flush=True)
-                        time.sleep(wait_time)
-                    else:
-                        connection_errors += 1
-            
-            # Update programs with details
-            batch_enhanced = 0
-            for program_id in batch:
-                if program_id in batch_details:
-                    details = batch_details[program_id]
-                    # Find corresponding program in epg_data and enhance it
-                    for program in self.epg_data:
-                        # Compare both as string and as int since IDs might be mixed types
-                        program_db_id = program.get('id')
-                        if str(program_db_id) == program_id or program_db_id == int(program_id):
-                            program.update(details)
-                            enhanced_count += 1
-                            batch_enhanced += 1
-                            break
-                else:
-                    failed_count += 1
-            
-            batch_time = time.time() - batch_start
-            
-            # Update progress bar with completion
-            progress_bar = show_progress_bar(current_batch, total_batches, "Enhancing EPG", 30)
-            status = "✓" if batch_enhanced > 0 else "✗"
-            print(f"\r{progress_bar} {status} Batch {current_batch}: {batch_enhanced}/{len(batch)} enhanced ({batch_time:.1f}s)", end="", flush=True)
-            
-            # Adaptive delay based on success rate
-            if batch_enhanced == 0:
-                # If we got no data, wait longer before next request
-                time.sleep(1.0)
+
+        for offset in range(0, len(missing_ids), batch_size):
+            batch = missing_ids[offset:offset + batch_size]
+            current_batch = offset // batch_size + 1
+            batch_details: Dict[str, Dict[str, Any]] = {}
+
+            for retry_count in range(3):
+                raw_details = self.get_program_details_batch(batch)
+                batch_details = {
+                    str(program_id): payload
+                    for program_id, payload in raw_details.items()
+                }
+                if batch_details:
+                    break
+                if retry_count < 2:
+                    time.sleep(2 ** (retry_count + 1))
+
+            if not batch_details:
+                connection_errors += 1
             else:
-                # Normal delay between successful batches  
-                time.sleep(0.5)
-            
-            # If we have too many connection errors, give up early
+                fetched_details.update(batch_details)
+                self._store_cached_details(batch_details)
+
+            progress_bar = show_progress_bar(current_batch, total_batches, "Enhancing EPG", 30)
+            print(
+                f"\r{progress_bar} Batch {current_batch}: "
+                f"{len(batch_details)}/{len(batch)} received",
+                end="",
+                flush=True,
+            )
+            time.sleep(0.5 if batch_details else 1.0)
+
             if connection_errors > 5:
-                print(f"\n\nWARNING: Too many connection errors ({connection_errors}). Stopping enhancement to avoid being blocked.")
+                print("\nWARNING: Too many connection errors; stopping detail requests.")
                 break
-        
-        # Final progress bar
-        final_progress = show_progress_bar(total_batches, total_batches, "Enhancing EPG", 30)
-        status = "✓ Complete" if enhanced_count > 0 else "✗ Failed"
-        print(f"\r{final_progress} {status}")
-        
+
+        if total_batches:
+            print()
+
+        all_details = {**cached_details, **fetched_details}
+        enhanced_count = 0
+        for program_id, details in all_details.items():
+            for program in programs_by_id.get(program_id, []):
+                program.update(details)
+                enhanced_count += 1
+
         total_time = time.time() - start_time
-        success_rate = (enhanced_count / len(program_ids)) * 100 if program_ids else 0
-        
-        print(f"Enhanced {enhanced_count} programs with detailed information.")
-        print(f"Failed requests: {failed_count}")
+        unique_success_rate = (len(all_details) / len(program_ids) * 100) if program_ids else 100
+        print(f"Enhanced {enhanced_count} programme entries ({unique_success_rate:.1f}% unique coverage).")
         print(f"Connection errors: {connection_errors}")
-        print(f"Success rate: {success_rate:.1f}%")
-        print(f"Total time: {total_time:.1f}s (avg: {total_time/len(program_ids):.3f}s per program)")
-        
-        if success_rate < 10:
-            print("\nWARNING: Very low success rate for enhancement.")
-            print("Consider using --no-details flag for faster execution without detailed program information.")
+        print(f"Total detail time: {total_time:.1f}s")
     
     def generate_xmltv(self, filename: Optional[str] = "zattoo_epg.xml", return_data: bool = False) -> Union[bool, str]:
         """Generate XMLTV file from collected EPG data.
@@ -473,7 +547,7 @@ class ZattooEPG:
                 # Display name
                 display_name = ET.SubElement(channel_elem, 'display-name')
                 display_name.set('lang', self.language)
-                display_name.text = channel_info['title'].replace('&', '&amp;')
+                display_name.text = channel_info['title']
                 
                 # Logo
                 if channel_info.get('logo'):
@@ -494,11 +568,11 @@ class ZattooEPG:
                     continue
                 
                 # Convert timestamps to XMLTV format
-                start_dt = datetime.fromtimestamp(start_time)
-                end_dt = datetime.fromtimestamp(end_time)
+                start_dt = datetime.fromtimestamp(start_time, self.timezone)
+                end_dt = datetime.fromtimestamp(end_time, self.timezone)
                 
-                start_str = start_dt.strftime('%Y%m%d%H%M%S +0200')
-                end_str = end_dt.strftime('%Y%m%d%H%M%S +0200')
+                start_str = start_dt.strftime('%Y%m%d%H%M%S %z')
+                end_str = end_dt.strftime('%Y%m%d%H%M%S %z')
                 
                 # Create programme element
                 programme_elem = ET.SubElement(tv_elem, 'programme')
@@ -529,7 +603,10 @@ class ZattooEPG:
                 image = program.get('i_t')  # Image URL
                 if image:
                     icon_elem = ET.SubElement(programme_elem, 'icon')
-                    icon_elem.set('src', f"https://images.zattic.com/cms/{image}/original.jpg")
+                    image_url = image if str(image).startswith(('http://', 'https://')) else (
+                        f"https://images.zattic.com/cms/{image}/original.jpg"
+                    )
+                    icon_elem.set('src', image_url)
                 
                 # Year
                 year = program.get('year')
@@ -607,11 +684,15 @@ class ZattooEPG:
                 return xml_buffer.getvalue().decode('utf-8')
             
             elif filename:
-                # Write to file
-                with open(filename, 'wb') as f:
+                # Write atomically so TVHeadend never reads a partially written guide.
+                output_path = Path(filename)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path = output_path.with_name(f".{output_path.name}.tmp")
+                with open(temporary_path, 'wb') as f:
                     f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
                     f.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
                     tree.write(f, encoding='utf-8')
+                os.replace(temporary_path, output_path)
                 
                 print(f"XMLTV file saved as: {filename}")
             
@@ -633,13 +714,8 @@ class ZattooEPG:
         if not text:
             return ""
         
-        # Replace HTML entities and remove HTML tags
-        text = text.replace('&', '&amp;')
-        text = text.replace('<', '&lt;')
-        text = text.replace('>', '&gt;')
-        text = re.sub(r'<[^>]*>', '', text)
-        
-        return text.strip()
+        # ElementTree performs XML escaping. Decode HTML entities and strip tags here.
+        return html.unescape(re.sub(r'<[^>]*>', '', str(text))).strip()
 
 
 def load_config(config_file: str = "config.json") -> Dict[str, str]:
@@ -662,6 +738,21 @@ def load_config(config_file: str = "config.json") -> Dict[str, str]:
     except json.JSONDecodeError as e:
         print(f"Invalid JSON in configuration file: {e}")
         sys.exit(1)
+
+
+def load_channel_filter(filter_file: Optional[str]) -> List[str]:
+    """Load exact channel IDs or names, one per line."""
+    if not filter_file:
+        return []
+    path = Path(filter_file)
+    if not path.is_file():
+        print(f"Channel filter file not found: {filter_file}")
+        sys.exit(1)
+    return [
+        line.strip()
+        for line in path.read_text(encoding='utf-8-sig').splitlines()
+        if line.strip() and not line.lstrip().startswith('#')
+    ]
 
 
 def send_xml_to_tvheadend(xml_data: str, socket_path: str = "/var/lib/tvheadend/epggrab/xmltv.sock") -> bool:
@@ -781,8 +872,12 @@ def get_credentials_from_config(config_file: str = "config.json") -> tuple:
     Returns:
         Tuple of (username, password)
     """
+    email = os.environ.get('ZATTOO_EMAIL', '').strip()
+    password = os.environ.get('ZATTOO_PASSWORD', '')
+    if email and password:
+        return email, password
+
     config = load_config(config_file)
-    
     email = config.get('email', '').strip()
     password = config.get('password', '')
     
@@ -840,7 +935,13 @@ def main():
     parser.add_argument('--no-details', action='store_true',
                       help='Skip downloading detailed program information (faster)')
     parser.add_argument('--config', default='config.json',
-                      help='Configuration file with email and password (default: config.json)')
+                      help='Configuration file; ZATTOO_EMAIL/ZATTOO_PASSWORD take precedence')
+    parser.add_argument('--channel-filter',
+                      help='Text file with exact channel IDs or names, one per line')
+    parser.add_argument('--cache', default='cache/program-details.sqlite3',
+                      help='SQLite detail cache (default: cache/program-details.sqlite3; empty disables)')
+    parser.add_argument('--cache-ttl-days', type=int, default=30,
+                      help='Detail cache lifetime in days (default: 30)')
     parser.add_argument('--interactive', action='store_true',
                       help='Use interactive login instead of config file')
     parser.add_argument('--debug', action='store_true',
@@ -880,7 +981,13 @@ def main():
     print()
     
     # Initialize EPG grabber
-    epg = ZattooEPG(country=args.country)
+    channel_filter = load_channel_filter(args.channel_filter)
+    epg = ZattooEPG(
+        country=args.country,
+        channel_filter=channel_filter,
+        cache_path=args.cache or None,
+        cache_ttl_days=args.cache_ttl_days,
+    )
     
     # Get session token
     if not epg.get_session_token():

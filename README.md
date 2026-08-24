@@ -2,6 +2,11 @@
 
 A Python program that downloads EPG data from Zattoo and saves it as an XMLTV file. This is a Python implementation of the [easyEPG project](https://github.com/sunsettrack4/easyepg).
 
+This maintained fork focuses on reliable Docker and TVHeadend operation. Detailed
+programme metadata is stored in a persistent SQLite cache, so programme images can
+remain enabled without downloading the same details on every update. A strict
+channel filter prevents unnecessary requests for channels that are not used.
+
 ## Features
 
 - **Login Authentication**: Uses the same API interface as the original program
@@ -10,10 +15,45 @@ A Python program that downloads EPG data from Zattoo and saves it as an XMLTV fi
 - **XMLTV Format**: Compatible output format for EPG viewers
 - **Detailed Program Information**: Optionally retrieve detailed program information
 - **Console Interface**: Simple command-line operation
+- **Programme Image Cache**: Persistent SQLite cache for detailed metadata
+- **Channel Filter**: Exact allow-list by Zattoo channel ID or display name
+- **Docker Support**: Scheduled generation plus a small HTTP endpoint for XMLTV
+- **Atomic Updates**: Readers never see a partially written XMLTV file
+
+## Docker quick start
+
+1. Create local configuration files (they are ignored by Git):
+
+```bash
+cp .env.example .env
+cp channels.example.txt channels.txt
+cp compose.example.yml compose.yml
+```
+
+2. Put the Zattoo account in `.env` and list the desired exact channel names in
+   `channels.txt`. Never commit `.env` or `config.json`.
+
+3. Build and start:
+
+```bash
+docker compose up -d --build
+```
+
+The first run fetches the selected channel details and therefore takes longer.
+Later runs reuse `/data/program-details.sqlite3`. The guide is regenerated every
+12 hours and is available at:
+
+```text
+http://SERVER-IP:8080/guide.xml
+```
+
+Point TVHeadend's XMLTV URL grabber at that URL. Test this fork on a separate
+port/output first; do not replace a working production EPG until channel mapping
+and programme images have been verified.
 
 ## Requirements
 
-- Python 3.7 or higher
+- Python 3.9 or higher (Python 3.12 is used by the Docker image)
 - Zattoo account (Germany or Switzerland)
 - Internet connection
 
@@ -54,6 +94,9 @@ cp config.example.json config.json
     "password": "your-password"
 }
 ```
+
+Alternatively set `ZATTOO_EMAIL` and `ZATTOO_PASSWORD`. Environment variables
+take precedence over `config.json`.
 
 ## Usage
 
@@ -98,6 +141,11 @@ python zattoo_epg.py --days 14
 # Custom configuration file
 python zattoo_epg.py --config my_config.json
 
+# Only selected channels, with a persistent detail/image cache
+python zattoo_epg.py --country CH --days 7 \
+  --channel-filter channels.txt \
+  --cache cache/program-details.sqlite3
+
 # Interactive login (without configuration file)
 python zattoo_epg.py --interactive
 ```
@@ -115,6 +163,9 @@ Available parameters:
 - `--no-details`: Skip detailed information (faster)
 - `--config`: Configuration file with email and password (default: config.json)
 - `--interactive`: Use interactive login instead of configuration file
+- `--channel-filter`: Exact channel IDs or names, one per line
+- `--cache`: SQLite file for detailed programme metadata
+- `--cache-ttl-days`: Lifetime of cached details (default: 30 days)
 - `--tvheadend`: Send EPG data to TVHeadend after generation
 - `--tvheadend-socket`: Path to TVHeadend XMLTV socket (default: /var/lib/tvheadend/epggrab/xmltv.sock)
 - `--tvheadend-only`: Send EPG data directly to TVHeadend without saving to file
@@ -179,12 +230,12 @@ python zattoo_epg.py
 
 ### Performance Issues
 
-Loading detailed information is very slow because:
-- Each program requires a separate API call
-- For 7 days this can be 80,000+ API requests
-- Zattoo's API has rate limiting and blocks too many requests
+Loading detailed information can be slow on the first run. This fork sends batched
+requests and caches results by programme ID. Keep the cache volume persistent and
+use a channel filter to minimize requests. A normal refresh then downloads only
+previously unseen programmes.
 
-**Solution**: Use `--no-details` for normal usage.
+Use `--no-details` only when programme images and extended metadata are not needed.
 
 ## TVHeadend Integration
 

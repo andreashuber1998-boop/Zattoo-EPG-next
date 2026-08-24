@@ -1,5 +1,10 @@
 # Configuration files containing credentials
 config.json
+.env
+channels.txt
+cache/
+output/
+*.sqlite3
 
 # Python cache files
 __pycache__/
