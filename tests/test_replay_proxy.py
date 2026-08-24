@@ -7,7 +7,7 @@ from replay_proxy import CatchupTimelineState, DashHlsSession, build_catchup_mpd
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
 
 HLS_MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S"><Period>
-<AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v1" bandwidth="5000000" codecs="avc1.4d402a" width="1920" height="1080" frameRate="50"><SegmentTemplate timescale="1000" initialization="video-$RepresentationID$-init.mp4" media="video-$RepresentationID$-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>
+<AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v1" bandwidth="5000000" codecs="avc1.4d402a" width="1920" height="1080" frameRate="50"><SegmentTemplate timescale="1000" initialization="video-$RepresentationID$-$Bandwidth$-init.mp4" media="video-$RepresentationID$-$Bandwidth$-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>
 <AdaptationSet contentType="audio" mimeType="audio/mp4"><Representation id="a1" bandwidth="256000" codecs="ec-3"><SegmentTemplate timescale="1000" initialization="audio-$RepresentationID$-init.mp4" media="audio-$RepresentationID$-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>
 </Period></MPD>'''
 
@@ -100,7 +100,7 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertEqual(audio.count("#EXTINF:"), 3600)
         self.assertEqual(
             session.segment_url(0, 10000000),
-            "https://media.example/live/video-v1-10000000.m4s",
+            "https://media.example/live/video-v1-5000000-10000000.m4s",
         )
         self.assertEqual(
             session.segment_url(1),
