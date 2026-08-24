@@ -482,8 +482,10 @@ video.addEventListener("progress", updateStatus);
 
 if (window.Hls && Hls.isSupported()) {{
   const hls = new Hls({{
+    // Deliberately omit liveMaxLatencyDuration. When it is set to a
+    // small value, hls.js treats an intentional DVR seek as excessive
+    // latency and automatically jumps back to the live edge.
     liveSyncDuration: configuredDelay,
-    liveMaxLatencyDuration: configuredDelay + 30,
     maxBufferLength: 90,
     maxMaxBufferLength: 180,
     backBufferLength: 7200,
