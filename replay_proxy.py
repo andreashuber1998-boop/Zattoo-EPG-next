@@ -73,6 +73,11 @@ def build_replay_mpd(source, offset_seconds):
     root = ET.fromstring(source)
     if local_name(root.tag) != "MPD":
         raise ValueError("upstream response is not a DASH MPD")
+    # FFmpeg's DASH probe expects the regular <MPD xmlns="..."> spelling.
+    # ElementTree otherwise serializes it as <ns0:MPD>, which is valid XML
+    # but is not recognized as DASH during format probing.
+    if root.tag.startswith("{"):
+        ET.register_namespace("", root.tag[1:].split("}", 1)[0])
     window_seconds = parse_duration(root.attrib.get("timeShiftBufferDepth", ""))
     if offset_seconds < 1 or offset_seconds > window_seconds:
         raise ValueError(f"offset must be between 1 and {int(window_seconds)} seconds")
