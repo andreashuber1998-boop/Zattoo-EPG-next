@@ -2,7 +2,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import os
 import tempfile
-from replay_proxy import CatchupTimelineState, DashHlsSession, build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
+from replay_proxy import CatchupTimelineState, DashHlsSession, build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, build_player_page, load_channel_allowlist, local_name
 
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
 
@@ -84,6 +84,18 @@ class ReplayProxyTests(unittest.TestCase):
             self.assertEqual(load_channel_allowlist(path), {"channel-one", "channel-two"})
         finally:
             os.unlink(path)
+
+    def test_player_page_uses_two_hour_window_and_larger_live_buffer(self):
+        page = build_player_page(
+            "prosieben", window_seconds=7200, delay_seconds=30
+        ).decode()
+        self.assertIn(
+            "/hls/prosieben/master.m3u8?window=7200&amp;delay=30",
+            page.replace("&", "&amp;"),
+        )
+        self.assertIn('data-back="7200"', page)
+        self.assertIn("maxBufferLength: 90", page)
+        self.assertIn("liveSyncDuration: configuredDelay", page)
 
     def test_dash_hls_gateway_builds_seekable_video_and_audio(self):
         session = DashHlsSession(
