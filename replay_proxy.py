@@ -108,6 +108,27 @@ def build_replay_mpd(source, offset_seconds):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+def build_timeshift_mpd(source, window_seconds=7200, delay_seconds=10):
+    """Keep the MPD dynamic, but advertise a bounded DVR window and live delay."""
+    root = ET.fromstring(source)
+    if local_name(root.tag) != "MPD":
+        raise ValueError("upstream response is not a DASH MPD")
+    if root.tag.startswith("{"):
+        ET.register_namespace("", root.tag[1:].split("}", 1)[0])
+    upstream_window = parse_duration(root.attrib.get("timeShiftBufferDepth", ""))
+    if window_seconds < 1 or window_seconds > upstream_window:
+        raise ValueError(f"window must be between 1 and {int(upstream_window)} seconds")
+    if delay_seconds < 1 or delay_seconds >= window_seconds:
+        raise ValueError("delay must be at least 1 second and smaller than the window")
+    root.attrib["type"] = "dynamic"
+    root.attrib["timeShiftBufferDepth"] = format_duration(window_seconds)
+    root.attrib["suggestedPresentationDelay"] = format_duration(delay_seconds)
+    root.attrib.pop("mediaPresentationDuration", None)
+    for period in (node for node in root.iter() if local_name(node.tag) == "Period"):
+        period.attrib.pop("duration", None)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 class ReplayHandler(BaseHTTPRequestHandler):
     upstream = os.environ.get("TELERISING_BASE_URL", "").rstrip("/")
     timeout = float(os.environ.get("REPLAY_UPSTREAM_TIMEOUT", "15"))
@@ -116,19 +137,27 @@ class ReplayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_response(HTTPStatus.OK); self.end_headers(); self.wfile.write(b"ok\n"); return
-        match = re.fullmatch(r"/replay/([^/]+)\.mpd", parsed.path)
-        if not match or not CHANNEL.fullmatch(match.group(1)):
+        match = re.fullmatch(r"/(replay|timeshift)/([^/]+)\.mpd", parsed.path)
+        if not match or not CHANNEL.fullmatch(match.group(2)):
             self.send_error(HTTPStatus.NOT_FOUND); return
         try:
             if not self.upstream:
                 raise ValueError("TELERISING_BASE_URL is not configured")
-            offset = int(parse_qs(parsed.query).get("offset", ["7200"])[0])
+            query = parse_qs(parsed.query)
             request = Request(
-                f"{self.upstream}/api/zc2/live/{quote(match.group(1))}",
+                f"{self.upstream}/api/zc2/live/{quote(match.group(2))}",
                 headers={"User-Agent": "Zattoo-EPG-Replay-Proxy/1.0"},
             )
             with urlopen(request, timeout=self.timeout) as response:
-                output = build_replay_mpd(response.read(), offset)
+                source = response.read()
+            if match.group(1) == "replay":
+                output = build_replay_mpd(source, int(query.get("offset", ["7200"])[0]))
+            else:
+                output = build_timeshift_mpd(
+                    source,
+                    int(query.get("window", ["7200"])[0]),
+                    int(query.get("delay", ["10"])[0]),
+                )
         except (ValueError, HTTPError, URLError, TimeoutError) as error:
             self.send_error(HTTPStatus.BAD_GATEWAY, str(error)); return
         self.send_response(HTTPStatus.OK)
