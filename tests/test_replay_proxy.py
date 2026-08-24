@@ -2,7 +2,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import os
 import tempfile
-from replay_proxy import build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
+from replay_proxy import CatchupTimelineState, build_catchup_mpd, build_replay_mpd, build_timeshift_mpd, load_channel_allowlist, local_name
 
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
 
@@ -45,6 +45,31 @@ class ReplayProxyTests(unittest.TestCase):
         segment = next(node for node in root.iter() if local_name(node.tag) == "S")
         self.assertEqual(segment.attrib["t"], "10000000")
         self.assertEqual(segment.attrib["r"], "5399")
+
+    def test_catchup_timeline_only_appends_and_never_moves_backwards(self):
+        state = CatchupTimelineState()
+        first = build_catchup_mpd(
+            MPD, window_seconds=7200, delay_seconds=10, state=state
+        )
+        shifted = MPD.replace(
+            b't="10000000" d="2000" r="5399"',
+            b't="10002000" d="2000" r="5399"',
+        )
+        second = build_catchup_mpd(
+            shifted, window_seconds=7200, delay_seconds=10, state=state
+        )
+        first_segment = next(
+            node for node in ET.fromstring(first).iter()
+            if local_name(node.tag) == "S"
+        )
+        second_segment = next(
+            node for node in ET.fromstring(second).iter()
+            if local_name(node.tag) == "S"
+        )
+        self.assertEqual(first_segment.attrib["t"], "10000000")
+        self.assertEqual(second_segment.attrib["t"], "10000000")
+        self.assertEqual(first_segment.attrib["r"], "5399")
+        self.assertEqual(second_segment.attrib["r"], "5400")
 
     def test_replay_channel_allowlist_ignores_comments(self):
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
