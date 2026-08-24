@@ -96,6 +96,7 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertIn('AUDIO="audio"', master)
         self.assertIn('URI="track-1.m3u8"', master)
         self.assertIn("#EXT-X-START:TIME-OFFSET=-10", video)
+        self.assertIn("#EXT-X-TARGETDURATION:8", video)
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:6800", video)
         self.assertEqual(video.count("#EXTINF:"), 3600)
         self.assertEqual(audio.count("#EXTINF:"), 3600)
