@@ -242,7 +242,16 @@ class DashHlsSession:
             entries = track["entries"]
             if not entries:
                 raise ValueError("track has no segments")
-            target = max(1, math.ceil(max(duration for _, duration in entries) / track["timescale"]))
+            # The provider may publish several 1.6-second segments in batches
+            # roughly every six seconds. A two-second target makes FFmpeg
+            # exhaust its unchanged-playlist retries before the next batch.
+            target = max(
+                8,
+                math.ceil(
+                    max(duration for _, duration in entries)
+                    / track["timescale"]
+                ),
+            )
             # HLS clients use MEDIA-SEQUENCE to recognize new segments in a
             # refreshed sliding playlist. Keeping this at zero makes FFmpeg
             # stop at the live edge after only a few seconds.
