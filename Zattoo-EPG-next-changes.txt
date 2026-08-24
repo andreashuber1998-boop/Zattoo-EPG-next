@@ -1,0 +1,887 @@
+From 8dd6b8aae470edca8a18029551bbf027857cc2ec Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 24 Aug 2026 02:24:26 +0100
+Subject: [PATCH] Add Docker workflow and cached channel filtering
+
+---
+ .dockerignore            |   8 +
+ .env.example             |   2 +
+ .gitignore               |   7 +-
+ Dockerfile               |  24 +++
+ README.md                |  63 +++++++-
+ channels.example.txt     |   8 +
+ compose.example.yml      |  19 +++
+ docker-entrypoint.sh     |  43 ++++++
+ requirements.txt         |   2 +-
+ tests/__init__.py        |   1 +
+ tests/test_zattoo_epg.py |  97 ++++++++++++
+ zattoo_epg.py            | 325 ++++++++++++++++++++++++++-------------
+ 12 files changed, 482 insertions(+), 117 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 .env.example
+ create mode 100644 Dockerfile
+ create mode 100644 channels.example.txt
+ create mode 100644 compose.example.yml
+ create mode 100644 docker-entrypoint.sh
+ create mode 100644 tests/__init__.py
+ create mode 100644 tests/test_zattoo_epg.py
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..e4daf67
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,8 @@
++.git
++.env
++config.json
++cache
++data
++output
++__pycache__
++*.pyc
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..d1fc4a4
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,2 @@
++ZATTOO_EMAIL=your-email@example.com
++ZATTOO_PASSWORD=replace-me
+diff --git a/.gitignore b/.gitignore
+index cdeeac4..ffb9e2f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,10 @@
+ # Configuration files containing credentials
+ config.json
++.env
++channels.txt
++cache/
++output/
++*.sqlite3
+ 
+ # Python cache files
+ __pycache__/
+@@ -18,4 +23,4 @@ env/
+ .DS_Store
+ Thumbs.db
+ 
+-config.json
+\ No newline at end of file
++config.json
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..e1267db
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,24 @@
++FROM python:3.12-slim
++
++ENV PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1
++
++WORKDIR /app
++
++COPY requirements.txt ./
++RUN apt-get update \
++    && apt-get install --no-install-recommends -y tzdata \
++    && rm -rf /var/lib/apt/lists/* \
++    && pip install --no-cache-dir -r requirements.txt \
++    && useradd --create-home --uid 1000 app \
++    && mkdir -p /data /output /config \
++    && chown -R app:app /app /data /output /config
++
++COPY --chown=app:app zattoo_epg.py docker-entrypoint.sh ./
++RUN chmod 0755 /app/docker-entrypoint.sh
++
++USER app
++EXPOSE 8080
++VOLUME ["/data", "/output", "/config"]
++
++ENTRYPOINT ["/app/docker-entrypoint.sh"]
+diff --git a/README.md b/README.md
+index 410efd4..baf0be6 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,11 @@
+ 
+ A Python program that downloads EPG data from Zattoo and saves it as an XMLTV file. This is a Python implementation of the [easyEPG project](https://github.com/sunsettrack4/easyepg).
+ 
++This maintained fork focuses on reliable Docker and TVHeadend operation. Detailed
++programme metadata is stored in a persistent SQLite cache, so programme images can
++remain enabled without downloading the same details on every update. A strict
++channel filter prevents unnecessary requests for channels that are not used.
++
+ ## Features
+ 
+ - **Login Authentication**: Uses the same API interface as the original program
+@@ -10,10 +15,45 @@ A Python program that downloads EPG data from Zattoo and saves it as an XMLTV fi
+ - **XMLTV Format**: Compatible output format for EPG viewers
+ - **Detailed Program Information**: Optionally retrieve detailed program information
+ - **Console Interface**: Simple command-line operation
++- **Programme Image Cache**: Persistent SQLite cache for detailed metadata
++- **Channel Filter**: Exact allow-list by Zattoo channel ID or display name
++- **Docker Support**: Scheduled generation plus a small HTTP endpoint for XMLTV
++- **Atomic Updates**: Readers never see a partially written XMLTV file
++
++## Docker quick start
++
++1. Create local configuration files (they are ignored by Git):
++
++```bash
++cp .env.example .env
++cp channels.example.txt channels.txt
++cp compose.example.yml compose.yml
++```
++
++2. Put the Zattoo account in `.env` and list the desired exact channel names in
++   `channels.txt`. Never commit `.env` or `config.json`.
++
++3. Build and start:
++
++```bash
++docker compose up -d --build
++```
++
++The first run fetches the selected channel details and therefore takes longer.
++Later runs reuse `/data/program-details.sqlite3`. The guide is regenerated every
++12 hours and is available at:
++
++```text
++http://SERVER-IP:8080/guide.xml
++```
++
++Point TVHeadend's XMLTV URL grabber at that URL. Test this fork on a separate
++port/output first; do not replace a working production EPG until channel mapping
++and programme images have been verified.
+ 
+ ## Requirements
+ 
+-- Python 3.7 or higher
++- Python 3.9 or higher (Python 3.12 is used by the Docker image)
+ - Zattoo account (Germany or Switzerland)
+ - Internet connection
+ 
+@@ -55,6 +95,9 @@ cp config.example.json config.json
+ }
+ ```
+ 
++Alternatively set `ZATTOO_EMAIL` and `ZATTOO_PASSWORD`. Environment variables
++take precedence over `config.json`.
++
+ ## Usage
+ 
+ ### Basic Usage (with configuration file)
+@@ -98,6 +141,11 @@ python zattoo_epg.py --days 14
+ # Custom configuration file
+ python zattoo_epg.py --config my_config.json
+ 
++# Only selected channels, with a persistent detail/image cache
++python zattoo_epg.py --country CH --days 7 \
++  --channel-filter channels.txt \
++  --cache cache/program-details.sqlite3
++
+ # Interactive login (without configuration file)
+ python zattoo_epg.py --interactive
+ ```
+@@ -115,6 +163,9 @@ Available parameters:
+ - `--no-details`: Skip detailed information (faster)
+ - `--config`: Configuration file with email and password (default: config.json)
+ - `--interactive`: Use interactive login instead of configuration file
++- `--channel-filter`: Exact channel IDs or names, one per line
++- `--cache`: SQLite file for detailed programme metadata
++- `--cache-ttl-days`: Lifetime of cached details (default: 30 days)
+ - `--tvheadend`: Send EPG data to TVHeadend after generation
+ - `--tvheadend-socket`: Path to TVHeadend XMLTV socket (default: /var/lib/tvheadend/epggrab/xmltv.sock)
+ - `--tvheadend-only`: Send EPG data directly to TVHeadend without saving to file
+@@ -179,12 +230,12 @@ python zattoo_epg.py
+ 
+ ### Performance Issues
+ 
+-Loading detailed information is very slow because:
+-- Each program requires a separate API call
+-- For 7 days this can be 80,000+ API requests
+-- Zattoo's API has rate limiting and blocks too many requests
++Loading detailed information can be slow on the first run. This fork sends batched
++requests and caches results by programme ID. Keep the cache volume persistent and
++use a channel filter to minimize requests. A normal refresh then downloads only
++previously unseen programmes.
+ 
+-**Solution**: Use `--no-details` for normal usage.
++Use `--no-details` only when programme images and extended metadata are not needed.
+ 
+ ## TVHeadend Integration
+ 
+diff --git a/channels.example.txt b/channels.example.txt
+new file mode 100644
+index 0000000..6e68000
+--- /dev/null
++++ b/channels.example.txt
+@@ -0,0 +1,8 @@
++# Exact Zattoo channel IDs or display names, one per line.
++# Replace this example with the names used by your own Zattoo account.
++SRF 1 HD
++SRF zwei HD
++Das Erste HD
++ZDF HD
++Pro7 Schweiz HD
++Sat.1 Schweiz HD
+diff --git a/compose.example.yml b/compose.example.yml
+new file mode 100644
+index 0000000..f2425ce
+--- /dev/null
++++ b/compose.example.yml
+@@ -0,0 +1,19 @@
++services:
++  zattoo-epg:
++    build: .
++    container_name: zattoo-epg
++    environment:
++      ZATTOO_EMAIL: ${ZATTOO_EMAIL:?Set ZATTOO_EMAIL in .env}
++      ZATTOO_PASSWORD: ${ZATTOO_PASSWORD:?Set ZATTOO_PASSWORD in .env}
++      COUNTRY: CH
++      DAYS: "7"
++      CHANNEL_FILTER_FILE: /config/channels.txt
++      CACHE_TTL_DAYS: "30"
++      UPDATE_INTERVAL_SECONDS: "43200"
++    volumes:
++      - ./data:/data
++      - ./output:/output
++      - ./channels.txt:/config/channels.txt:ro
++    ports:
++      - "8080:8080"
++    restart: unless-stopped
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+new file mode 100644
+index 0000000..a9d3a6b
+--- /dev/null
++++ b/docker-entrypoint.sh
+@@ -0,0 +1,43 @@
++#!/bin/sh
++set -eu
++
++COUNTRY="${COUNTRY:-CH}"
++DAYS="${DAYS:-7}"
++OUTPUT_FILE="${OUTPUT_FILE:-/output/guide.xml}"
++CACHE_FILE="${CACHE_FILE:-/data/program-details.sqlite3}"
++CACHE_TTL_DAYS="${CACHE_TTL_DAYS:-30}"
++UPDATE_INTERVAL_SECONDS="${UPDATE_INTERVAL_SECONDS:-43200}"
++HTTP_PORT="${HTTP_PORT:-8080}"
++
++generate_guide() {
++    set -- \
++        --country "$COUNTRY" \
++        --days "$DAYS" \
++        --output "$OUTPUT_FILE" \
++        --cache "$CACHE_FILE" \
++        --cache-ttl-days "$CACHE_TTL_DAYS"
++
++    if [ -n "${CHANNEL_FILTER_FILE:-}" ]; then
++        set -- "$@" --channel-filter "$CHANNEL_FILTER_FILE"
++    fi
++
++    if [ "${NO_DETAILS:-false}" = "true" ]; then
++        set -- "$@" --no-details
++    fi
++
++    python /app/zattoo_epg.py "$@"
++}
++
++generate_guide
++
++if [ "${RUN_ONCE:-false}" = "true" ]; then
++    exit 0
++fi
++
++python -m http.server "$HTTP_PORT" --directory /output &
++HTTP_PID=$!
++trap 'kill "$HTTP_PID" 2>/dev/null || true' EXIT INT TERM
++
++while sleep "$UPDATE_INTERVAL_SECONDS"; do
++    generate_guide
++done
+diff --git a/requirements.txt b/requirements.txt
+index a8608b2..1989fc4 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1 @@
+-requests>=2.28.0
++requests>=2.32.0,<3
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..c8670f4
+--- /dev/null
++++ b/tests/__init__.py
+@@ -0,0 +1 @@
++"""Tests for Zattoo EPG Next."""
+diff --git a/tests/test_zattoo_epg.py b/tests/test_zattoo_epg.py
+new file mode 100644
+index 0000000..b2b7947
+--- /dev/null
++++ b/tests/test_zattoo_epg.py
+@@ -0,0 +1,97 @@
++import os
++import tempfile
++import unittest
++import xml.etree.ElementTree as ET
++from unittest import mock
++
++from zattoo_epg import ZattooEPG, get_credentials_from_config, load_channel_filter
++
++
++class ZattooEPGTests(unittest.TestCase):
++    def test_channel_filter_matches_exact_id_or_title(self):
++        epg = ZattooEPG(channel_filter=["SRF 1 HD", "srf2.ch"])
++
++        self.assertTrue(epg._channel_is_selected("SRF1.ch", "SRF 1 HD"))
++        self.assertTrue(epg._channel_is_selected("SRF2.ch", "SRF zwei HD"))
++        self.assertFalse(epg._channel_is_selected("SRFinfo.ch", "SRF info HD"))
++
++    def test_detail_cache_avoids_repeated_api_lookup(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            cache_path = os.path.join(temp_dir, "details.sqlite3")
++            epg = ZattooEPG(cache_path=cache_path)
++            epg.epg_data = [
++                {"id": 1, "cid": "one"},
++                {"id": 1, "cid": "one"},
++                {"id": 2, "cid": "two"},
++            ]
++            epg._store_cached_details({"1": {"i_t": "cached-image"}})
++
++            with mock.patch.object(
++                epg,
++                "get_program_details_batch",
++                return_value={"2": {"i_t": "new-image"}},
++            ) as api_call, mock.patch("zattoo_epg.time.sleep"):
++                epg.enhance_epg_data()
++
++            api_call.assert_called_once_with(["2"])
++            self.assertEqual(epg.epg_data[0]["i_t"], "cached-image")
++            self.assertEqual(epg.epg_data[1]["i_t"], "cached-image")
++            self.assertEqual(epg.epg_data[2]["i_t"], "new-image")
++
++    def test_detail_cache_supports_large_guides(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            epg = ZattooEPG(cache_path=os.path.join(temp_dir, "details.sqlite3"))
++            details = {str(index): {"title": f"Programme {index}"} for index in range(1005)}
++            epg._store_cached_details(details)
++
++            self.assertEqual(len(epg._load_cached_details(list(details))), 1005)
++
++    def test_xmltv_contains_image_and_correct_winter_timezone(self):
++        epg = ZattooEPG(country="CH")
++        epg.channels = {"channel-1": {"title": "A & B", "logo": "https://logo"}}
++        epg.epg_data = [
++            {
++                "id": 1,
++                "cid": "channel-1",
++                "s": 1767261600,
++                "e": 1767265200,
++                "t": "News & Weather",
++                "i_t": "poster-id",
++            }
++        ]
++
++        xml_data = epg.generate_xmltv(filename=None, return_data=True)
++        root = ET.fromstring(xml_data)
++        programme = root.find("programme")
++
++        self.assertEqual(root.findtext("channel/display-name"), "A & B")
++        self.assertEqual(programme.findtext("title"), "News & Weather")
++        self.assertTrue(programme.attrib["start"].endswith("+0100"))
++        self.assertEqual(
++            programme.find("icon").attrib["src"],
++            "https://images.zattic.com/cms/poster-id/original.jpg",
++        )
++
++    def test_environment_credentials_take_precedence(self):
++        with mock.patch.dict(
++            os.environ,
++            {"ZATTOO_EMAIL": "user@example.com", "ZATTOO_PASSWORD": "secret"},
++            clear=False,
++        ):
++            self.assertEqual(
++                get_credentials_from_config("missing.json"),
++                ("user@example.com", "secret"),
++            )
++
++    def test_channel_filter_file_ignores_comments(self):
++        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
++            handle.write("# comment\nSRF 1 HD\n\nZDF HD\n")
++            path = handle.name
++        try:
++            self.assertEqual(load_channel_filter(path), ["SRF 1 HD", "ZDF HD"])
++        finally:
++            os.unlink(path)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/zattoo_epg.py b/zattoo_epg.py
+index 7b91045..bc66aee 100755
+--- a/zattoo_epg.py
++++ b/zattoo_epg.py
+@@ -21,12 +21,22 @@ from typing import Dict, List, Optional, Any, Union
+ import argparse
+ import socket
+ import subprocess
++import sqlite3
++import html
++from pathlib import Path
++from zoneinfo import ZoneInfo
+ 
+ 
+ class ZattooEPG:
+     """Main class for Zattoo EPG downloading and processing."""
+     
+-    def __init__(self, country: str = "DE"):
++    def __init__(
++        self,
++        country: str = "DE",
++        channel_filter: Optional[List[str]] = None,
++        cache_path: Optional[str] = None,
++        cache_ttl_days: int = 30,
++    ):
+         """Initialize the Zattoo EPG grabber.
+         
+         Args:
+@@ -34,11 +44,21 @@ class ZattooEPG:
+         """
+         self.country = country.upper()
+         self.language = "de" if country.upper() == "DE" else "de"
++        self.timezone = ZoneInfo("Europe/Berlin" if self.country == "DE" else "Europe/Zurich")
+         self.session = requests.Session()
+         self.session_token = None
+         self.power_guide_hash = None
+         self.channels = {}
+         self.epg_data = []
++        self.channel_filter = {
++            self._normalize_channel_name(item)
++            for item in (channel_filter or [])
++            if item.strip()
++        }
++        self.cache_path = cache_path
++        self.cache_ttl_seconds = cache_ttl_days * 86400
++        if self.cache_path:
++            self._init_cache()
+         
+         # Set User-Agent
+         self.session.headers.update({
+@@ -48,6 +68,84 @@ class ZattooEPG:
+         })
+         
+         print(f"+++ COUNTRY: {self.country} +++\n")
++
++    @staticmethod
++    def _normalize_channel_name(value: str) -> str:
++        """Normalize a channel identifier for exact, case-insensitive matching."""
++        return " ".join(value.casefold().split())
++
++    def _channel_is_selected(self, cid: str, title: str) -> bool:
++        if not self.channel_filter:
++            return True
++        return bool(
++            {
++                self._normalize_channel_name(cid),
++                self._normalize_channel_name(title),
++            }
++            & self.channel_filter
++        )
++
++    def _init_cache(self) -> None:
++        cache_file = Path(self.cache_path)
++        cache_file.parent.mkdir(parents=True, exist_ok=True)
++        with sqlite3.connect(cache_file) as connection:
++            connection.execute(
++                """
++                CREATE TABLE IF NOT EXISTS program_details (
++                    program_id TEXT PRIMARY KEY,
++                    payload TEXT NOT NULL,
++                    updated_at INTEGER NOT NULL
++                )
++                """
++            )
++
++    def _load_cached_details(self, program_ids: List[str]) -> Dict[str, Dict[str, Any]]:
++        if not self.cache_path or not program_ids:
++            return {}
++        minimum_timestamp = int(time.time()) - self.cache_ttl_seconds
++        rows = []
++        with sqlite3.connect(self.cache_path) as connection:
++            # Stay below SQLite's variable limit even for large guides.
++            for offset in range(0, len(program_ids), 900):
++                chunk = program_ids[offset:offset + 900]
++                placeholders = ",".join("?" for _ in chunk)
++                rows.extend(
++                    connection.execute(
++                        f"""
++                        SELECT program_id, payload
++                        FROM program_details
++                        WHERE updated_at >= ? AND program_id IN ({placeholders})
++                        """,
++                        [minimum_timestamp, *chunk],
++                    ).fetchall()
++                )
++        result = {}
++        for program_id, payload in rows:
++            try:
++                result[str(program_id)] = json.loads(payload)
++            except json.JSONDecodeError:
++                continue
++        return result
++
++    def _store_cached_details(self, details: Dict[str, Dict[str, Any]]) -> None:
++        if not self.cache_path or not details:
++            return
++        updated_at = int(time.time())
++        rows = [
++            (str(program_id), json.dumps(payload, ensure_ascii=False), updated_at)
++            for program_id, payload in details.items()
++        ]
++        with sqlite3.connect(self.cache_path) as connection:
++            connection.executemany(
++                """
++                INSERT INTO program_details(program_id, payload, updated_at)
++                VALUES (?, ?, ?)
++                ON CONFLICT(program_id) DO UPDATE SET
++                    payload=excluded.payload,
++                    updated_at=excluded.updated_at
++                """,
++                rows,
++            )
+     
+     def get_session_token(self) -> bool:
+         """Get initial session token from Zattoo."""
+@@ -183,7 +281,7 @@ class ZattooEPG:
+                         cid = channel.get('cid')
+                         title = channel.get('title', '')
+                         
+-                        if cid and title:
++                        if cid and title and self._channel_is_selected(str(cid), title):
+                             # Get logo URL
+                             logo_url = ""
+                             qualities = channel.get('qualities', [])
+@@ -199,6 +297,8 @@ class ZattooEPG:
+                             }
+             
+             print(f" OK! ({len(self.channels)} channels)")
++            if self.channel_filter:
++                print(f"Channel filter active: {len(self.channel_filter)} requested entries")
+             return len(self.channels) > 0
+             
+         except Exception as e:
+@@ -266,7 +366,7 @@ class ZattooEPG:
+                         cid = channel.get('cid') or channel.get('id')
+                         channel_programs = channel.get('programs', [])
+                         
+-                        if cid and channel_programs:
++                        if cid in self.channels and channel_programs:
+                             for program in channel_programs:
+                                 # Add channel ID to program data
+                                 program['cid'] = cid
+@@ -345,102 +445,76 @@ class ZattooEPG:
+         """Enhance EPG data with detailed program information."""
+         print("Enhancing EPG data with details...")
+         start_time = time.time()
+-        
+-        program_ids = []
++
++        programs_by_id: Dict[str, List[Dict[str, Any]]] = {}
+         for program in self.epg_data:
+             program_id = program.get('id')
+-            if program_id:
+-                program_ids.append(str(program_id))  # Convert to string
+-        
+-        print(f"Fetching details for {len(program_ids)} programs...")
+-        
+-        # Use smaller batches and longer delays to avoid rate limiting
+-        batch_size = 20  # Smaller batch size to be more respectful
+-        enhanced_count = 0
+-        failed_count = 0
++            if program_id is not None:
++                programs_by_id.setdefault(str(program_id), []).append(program)
++
++        program_ids = list(programs_by_id)
++        cached_details = self._load_cached_details(program_ids)
++        missing_ids = [program_id for program_id in program_ids if program_id not in cached_details]
++        print(
++            f"Unique programs: {len(program_ids)}; cache hits: {len(cached_details)}; "
++            f"API lookups: {len(missing_ids)}"
++        )
++
++        fetched_details: Dict[str, Dict[str, Any]] = {}
++        batch_size = 20
++        total_batches = (len(missing_ids) + batch_size - 1) // batch_size
+         connection_errors = 0
+-        
+-        total_batches = (len(program_ids) + batch_size - 1) // batch_size
+-        
+-        for i in range(0, len(program_ids), batch_size):
+-            batch = program_ids[i:i + batch_size]
+-            batch_start = time.time()
+-            current_batch = i // batch_size + 1
+-            
+-            # Show progress bar
+-            progress_bar = show_progress_bar(current_batch - 1, total_batches, "Enhancing EPG", 30)
+-            print(f"\r{progress_bar}", end="", flush=True)
+-            
+-            # Use batch request instead of individual requests with retry mechanism
+-            batch_details = {}
+-            retry_count = 0
+-            max_retries = 3
+-            
+-            while retry_count < max_retries and not batch_details:
+-                batch_details = self.get_program_details_batch(batch)
+-                if not batch_details:
+-                    retry_count += 1
+-                    if retry_count < max_retries:
+-                        wait_time = 2 ** retry_count  # Exponential backoff: 2s, 4s, 8s
+-                        print(f"\n  RETRY {retry_count}/{max_retries} in {wait_time}s...", end="", flush=True)
+-                        time.sleep(wait_time)
+-                    else:
+-                        connection_errors += 1
+-            
+-            # Update programs with details
+-            batch_enhanced = 0
+-            for program_id in batch:
+-                if program_id in batch_details:
+-                    details = batch_details[program_id]
+-                    # Find corresponding program in epg_data and enhance it
+-                    for program in self.epg_data:
+-                        # Compare both as string and as int since IDs might be mixed types
+-                        program_db_id = program.get('id')
+-                        if str(program_db_id) == program_id or program_db_id == int(program_id):
+-                            program.update(details)
+-                            enhanced_count += 1
+-                            batch_enhanced += 1
+-                            break
+-                else:
+-                    failed_count += 1
+-            
+-            batch_time = time.time() - batch_start
+-            
+-            # Update progress bar with completion
+-            progress_bar = show_progress_bar(current_batch, total_batches, "Enhancing EPG", 30)
+-            status = "✓" if batch_enhanced > 0 else "✗"
+-            print(f"\r{progress_bar} {status} Batch {current_batch}: {batch_enhanced}/{len(batch)} enhanced ({batch_time:.1f}s)", end="", flush=True)
+-            
+-            # Adaptive delay based on success rate
+-            if batch_enhanced == 0:
+-                # If we got no data, wait longer before next request
+-                time.sleep(1.0)
++
++        for offset in range(0, len(missing_ids), batch_size):
++            batch = missing_ids[offset:offset + batch_size]
++            current_batch = offset // batch_size + 1
++            batch_details: Dict[str, Dict[str, Any]] = {}
++
++            for retry_count in range(3):
++                raw_details = self.get_program_details_batch(batch)
++                batch_details = {
++                    str(program_id): payload
++                    for program_id, payload in raw_details.items()
++                }
++                if batch_details:
++                    break
++                if retry_count < 2:
++                    time.sleep(2 ** (retry_count + 1))
++
++            if not batch_details:
++                connection_errors += 1
+             else:
+-                # Normal delay between successful batches  
+-                time.sleep(0.5)
+-            
+-            # If we have too many connection errors, give up early
++                fetched_details.update(batch_details)
++                self._store_cached_details(batch_details)
++
++            progress_bar = show_progress_bar(current_batch, total_batches, "Enhancing EPG", 30)
++            print(
++                f"\r{progress_bar} Batch {current_batch}: "
++                f"{len(batch_details)}/{len(batch)} received",
++                end="",
++                flush=True,
++            )
++            time.sleep(0.5 if batch_details else 1.0)
++
+             if connection_errors > 5:
+-                print(f"\n\nWARNING: Too many connection errors ({connection_errors}). Stopping enhancement to avoid being blocked.")
++                print("\nWARNING: Too many connection errors; stopping detail requests.")
+                 break
+-        
+-        # Final progress bar
+-        final_progress = show_progress_bar(total_batches, total_batches, "Enhancing EPG", 30)
+-        status = "✓ Complete" if enhanced_count > 0 else "✗ Failed"
+-        print(f"\r{final_progress} {status}")
+-        
++
++        if total_batches:
++            print()
++
++        all_details = {**cached_details, **fetched_details}
++        enhanced_count = 0
++        for program_id, details in all_details.items():
++            for program in programs_by_id.get(program_id, []):
++                program.update(details)
++                enhanced_count += 1
++
+         total_time = time.time() - start_time
+-        success_rate = (enhanced_count / len(program_ids)) * 100 if program_ids else 0
+-        
+-        print(f"Enhanced {enhanced_count} programs with detailed information.")
+-        print(f"Failed requests: {failed_count}")
++        unique_success_rate = (len(all_details) / len(program_ids) * 100) if program_ids else 100
++        print(f"Enhanced {enhanced_count} programme entries ({unique_success_rate:.1f}% unique coverage).")
+         print(f"Connection errors: {connection_errors}")
+-        print(f"Success rate: {success_rate:.1f}%")
+-        print(f"Total time: {total_time:.1f}s (avg: {total_time/len(program_ids):.3f}s per program)")
+-        
+-        if success_rate < 10:
+-            print("\nWARNING: Very low success rate for enhancement.")
+-            print("Consider using --no-details flag for faster execution without detailed program information.")
++        print(f"Total detail time: {total_time:.1f}s")
+     
+     def generate_xmltv(self, filename: Optional[str] = "zattoo_epg.xml", return_data: bool = False) -> Union[bool, str]:
+         """Generate XMLTV file from collected EPG data.
+@@ -473,7 +547,7 @@ class ZattooEPG:
+                 # Display name
+                 display_name = ET.SubElement(channel_elem, 'display-name')
+                 display_name.set('lang', self.language)
+-                display_name.text = channel_info['title'].replace('&', '&amp;')
++                display_name.text = channel_info['title']
+                 
+                 # Logo
+                 if channel_info.get('logo'):
+@@ -494,11 +568,11 @@ class ZattooEPG:
+                     continue
+                 
+                 # Convert timestamps to XMLTV format
+-                start_dt = datetime.fromtimestamp(start_time)
+-                end_dt = datetime.fromtimestamp(end_time)
++                start_dt = datetime.fromtimestamp(start_time, self.timezone)
++                end_dt = datetime.fromtimestamp(end_time, self.timezone)
+                 
+-                start_str = start_dt.strftime('%Y%m%d%H%M%S +0200')
+-                end_str = end_dt.strftime('%Y%m%d%H%M%S +0200')
++                start_str = start_dt.strftime('%Y%m%d%H%M%S %z')
++                end_str = end_dt.strftime('%Y%m%d%H%M%S %z')
+                 
+                 # Create programme element
+                 programme_elem = ET.SubElement(tv_elem, 'programme')
+@@ -529,7 +603,10 @@ class ZattooEPG:
+                 image = program.get('i_t')  # Image URL
+                 if image:
+                     icon_elem = ET.SubElement(programme_elem, 'icon')
+-                    icon_elem.set('src', f"https://images.zattic.com/cms/{image}/original.jpg")
++                    image_url = image if str(image).startswith(('http://', 'https://')) else (
++                        f"https://images.zattic.com/cms/{image}/original.jpg"
++                    )
++                    icon_elem.set('src', image_url)
+                 
+                 # Year
+                 year = program.get('year')
+@@ -607,11 +684,15 @@ class ZattooEPG:
+                 return xml_buffer.getvalue().decode('utf-8')
+             
+             elif filename:
+-                # Write to file
+-                with open(filename, 'wb') as f:
++                # Write atomically so TVHeadend never reads a partially written guide.
++                output_path = Path(filename)
++                output_path.parent.mkdir(parents=True, exist_ok=True)
++                temporary_path = output_path.with_name(f".{output_path.name}.tmp")
++                with open(temporary_path, 'wb') as f:
+                     f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+                     f.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
+                     tree.write(f, encoding='utf-8')
++                os.replace(temporary_path, output_path)
+                 
+                 print(f"XMLTV file saved as: {filename}")
+             
+@@ -633,13 +714,8 @@ class ZattooEPG:
+         if not text:
+             return ""
+         
+-        # Replace HTML entities and remove HTML tags
+-        text = text.replace('&', '&amp;')
+-        text = text.replace('<', '&lt;')
+-        text = text.replace('>', '&gt;')
+-        text = re.sub(r'<[^>]*>', '', text)
+-        
+-        return text.strip()
++        # ElementTree performs XML escaping. Decode HTML entities and strip tags here.
++        return html.unescape(re.sub(r'<[^>]*>', '', str(text))).strip()
+ 
+ 
+ def load_config(config_file: str = "config.json") -> Dict[str, str]:
+@@ -664,6 +740,21 @@ def load_config(config_file: str = "config.json") -> Dict[str, str]:
+         sys.exit(1)
+ 
+ 
++def load_channel_filter(filter_file: Optional[str]) -> List[str]:
++    """Load exact channel IDs or names, one per line."""
++    if not filter_file:
++        return []
++    path = Path(filter_file)
++    if not path.is_file():
++        print(f"Channel filter file not found: {filter_file}")
++        sys.exit(1)
++    return [
++        line.strip()
++        for line in path.read_text(encoding='utf-8-sig').splitlines()
++        if line.strip() and not line.lstrip().startswith('#')
++    ]
++
++
+ def send_xml_to_tvheadend(xml_data: str, socket_path: str = "/var/lib/tvheadend/epggrab/xmltv.sock") -> bool:
+     """Send XMLTV data directly to TVHeadend via Unix socket.
+     
+@@ -781,8 +872,12 @@ def get_credentials_from_config(config_file: str = "config.json") -> tuple:
+     Returns:
+         Tuple of (username, password)
+     """
++    email = os.environ.get('ZATTOO_EMAIL', '').strip()
++    password = os.environ.get('ZATTOO_PASSWORD', '')
++    if email and password:
++        return email, password
++
+     config = load_config(config_file)
+-    
+     email = config.get('email', '').strip()
+     password = config.get('password', '')
+     
+@@ -840,7 +935,13 @@ def main():
+     parser.add_argument('--no-details', action='store_true',
+                       help='Skip downloading detailed program information (faster)')
+     parser.add_argument('--config', default='config.json',
+-                      help='Configuration file with email and password (default: config.json)')
++                      help='Configuration file; ZATTOO_EMAIL/ZATTOO_PASSWORD take precedence')
++    parser.add_argument('--channel-filter',
++                      help='Text file with exact channel IDs or names, one per line')
++    parser.add_argument('--cache', default='cache/program-details.sqlite3',
++                      help='SQLite detail cache (default: cache/program-details.sqlite3; empty disables)')
++    parser.add_argument('--cache-ttl-days', type=int, default=30,
++                      help='Detail cache lifetime in days (default: 30)')
+     parser.add_argument('--interactive', action='store_true',
+                       help='Use interactive login instead of config file')
+     parser.add_argument('--debug', action='store_true',
+@@ -880,7 +981,13 @@ def main():
+     print()
+     
+     # Initialize EPG grabber
+-    epg = ZattooEPG(country=args.country)
++    channel_filter = load_channel_filter(args.channel_filter)
++    epg = ZattooEPG(
++        country=args.country,
++        channel_filter=channel_filter,
++        cache_path=args.cache or None,
++        cache_ttl_days=args.cache_ttl_days,
++    )
+     
+     # Get session token
+     if not epg.get_session_token():
+-- 
+2.51.1
+
