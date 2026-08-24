@@ -1,6 +1,6 @@
 import unittest
 import xml.etree.ElementTree as ET
-from replay_proxy import build_replay_mpd, local_name
+from replay_proxy import build_replay_mpd, build_timeshift_mpd, local_name
 
 MPD = b'''<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" timeShiftBufferDepth="PT10800S" minimumUpdatePeriod="PT2S" availabilityStartTime="1970-01-01T00:00:00Z"><Period><AdaptationSet><Representation><SegmentTemplate timescale="1000" presentationTimeOffset="0" media="v-$Time$.m4s"><SegmentTimeline><S t="10000000" d="2000" r="5399"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>'''
 
@@ -22,5 +22,13 @@ class ReplayProxyTests(unittest.TestCase):
     def test_rejects_offset_outside_window(self):
         with self.assertRaisesRegex(ValueError, "between 1 and 10800"):
             build_replay_mpd(MPD, 10801)
+
+    def test_dynamic_timeshift_starts_near_live_and_keeps_two_hour_window(self):
+        output = build_timeshift_mpd(MPD, window_seconds=7200, delay_seconds=10)
+        self.assertNotIn(b"ns0:MPD", output)
+        root = ET.fromstring(output)
+        self.assertEqual(root.attrib["type"], "dynamic")
+        self.assertEqual(root.attrib["timeShiftBufferDepth"], "PT7200S")
+        self.assertEqual(root.attrib["suggestedPresentationDelay"], "PT10S")
 
 if __name__ == "__main__": unittest.main()
