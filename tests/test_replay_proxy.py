@@ -40,9 +40,11 @@ class ReplayProxyTests(unittest.TestCase):
         self.assertEqual(root.attrib["timeShiftBufferDepth"], "PT7200S")
         self.assertEqual(root.attrib["suggestedPresentationDelay"], "PT10S")
         self.assertNotIn("mediaPresentationDuration", root.attrib)
+        self.assertEqual(root.attrib["minimumUpdatePeriod"], "PT2S")
+        self.assertTrue(root.attrib["publishTime"].endswith("Z"))
         segment = next(node for node in root.iter() if local_name(node.tag) == "S")
-        self.assertEqual(segment.attrib["t"], "13600000")
-        self.assertEqual(segment.attrib["r"], "3599")
+        self.assertEqual(segment.attrib["t"], "10000000")
+        self.assertEqual(segment.attrib["r"], "5399")
 
     def test_replay_channel_allowlist_ignores_comments(self):
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
